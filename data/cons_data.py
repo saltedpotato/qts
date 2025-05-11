@@ -52,12 +52,9 @@ class get_cons:
         with open(self.out_file, "w") as json_file:
             json.dump(tickers_dictionary, json_file, default=str)
 
-    def run(self, output=True):
+    def run(self):
         self.query_db()
-        if output and not os.path.exists(f"./{self.out_file}"):
-            self.output()
-        else:
-            print(f"{self.out_file} already exist")
+        self.output()
 
     def read(
         self,
@@ -66,3 +63,5 @@ class get_cons:
             with open(self.out_file, "r") as json_file:
                 data = json.load(json_file)
                 return data
+        else:
+            print("no file")
