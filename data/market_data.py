@@ -336,7 +336,7 @@ class market_data:
         else:
             raise ValueError("wrong timing")
 
-        return filtered_df
+        return filtered_df.drop(["min_time", "max_time"])
 
     def prep_time(self) -> None:
         """
