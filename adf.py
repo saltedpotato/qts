@@ -1,6 +1,7 @@
 import numba
 import numpy as np
 import math
+from typing import Optional, Tuple
 
 spec = [
     ("tau_star_c", numba.float64[:]),
@@ -13,7 +14,30 @@ spec = [
 
 @numba.experimental.jitclass(spec)
 class ADF_Test:
+    """
+    A class for performing the Augmented Dickey-Fuller (ADF) test and calculating p-values
+    for time series stationarity using pre-defined critical values for different sample sizes.
+
+    Attributes
+    ----------
+    tau_star_c : np.ndarray
+        Critical values for tau statistics at different levels.
+    tau_min_c : np.ndarray
+        Minimum critical values for tau statistics.
+    tau_max_c : np.ndarray
+        Maximum critical values for tau statistics.
+    tau_c_smallp : np.ndarray
+        Small sample size critical values for tau statistics for small p-values.
+    tau_c_largep : np.ndarray
+        Large sample size critical values for tau statistics for large p-values.
+    """
+
     def __init__(self):
+        """
+        Initializes the ADF_Test object with predefined critical values for tau statistics.
+
+        The values are based on the Augmented Dickey-Fuller test for different lag lengths.
+        """
         self.tau_star_c = np.array(
             [-1.61, -2.62, -3.13, -3.47, -3.78, -3.93], dtype=np.float64
         )
@@ -50,16 +74,63 @@ class ADF_Test:
         )
         self.tau_c_largep = tau_c_largep * large_scaling
 
-    def norm_cdf(self, x, mean=0, std_dev=1):
+    def norm_cdf(self, x: float, mean: float = 0, std_dev: float = 1) -> float:
+        """
+        Computes the cumulative distribution function (CDF) of the standard normal distribution.
+
+        Parameters
+        ----------
+        x : float
+            The value at which the CDF is evaluated.
+        mean : float, optional
+            The mean of the distribution (default is 0).
+        std_dev : float, optional
+            The standard deviation of the distribution (default is 1).
+
+        Returns
+        -------
+        float
+            The CDF value for the given `x`.
+        """
         return 0.5 * (1 + math.erf((x - mean) / (std_dev * math.sqrt(2))))
 
-    def horner_eval(self, coeffs, x):
+    def horner_eval(self, coeffs: np.ndarray, x: float) -> float:
+        """
+        Evaluates a polynomial using Horner's method.
+
+        Parameters
+        ----------
+        coeffs : np.ndarray
+            Coefficients of the polynomial, ordered from highest to lowest degree.
+        x : float
+            The point at which the polynomial is evaluated.
+
+        Returns
+        -------
+        float
+            The result of evaluating the polynomial at `x`.
+        """
         result = 0.0
         for c in coeffs:
             result = result * x + c
         return result
 
-    def mackinnonp(self, teststat, N=1):
+    def mackinnonp(self, teststat: float, N: int = 1) -> float:
+        """
+        Computes the p-value based on the given test statistic using the MacKinnon p-value method.
+
+        Parameters
+        ----------
+        teststat : float
+            The test statistic to compute the p-value for.
+        N : int, optional
+            The number of lags used in the test (default is 1).
+
+        Returns
+        -------
+        float
+            The computed p-value.
+        """
         maxstat = self.tau_max_c
         minstat = self.tau_min_c
         starstat = self.tau_star_c
@@ -74,13 +145,52 @@ class ADF_Test:
             tau_coef = self.tau_c_largep[N - 1]
         return self.norm_cdf(self.horner_eval(tau_coef[::-1], teststat))
 
-    def narrow(self, input, dim, start, length):
+    def narrow(
+        self, input: np.ndarray, dim: int, start: int, length: int
+    ) -> np.ndarray:
+        """
+        Extracts a subarray from the input array along the specified dimension.
+
+        Parameters
+        ----------
+        input : np.ndarray
+            The input array from which to extract the subarray.
+        dim : int
+            The dimension along which to slice (0 for rows, 1 for columns).
+        start : int
+            The starting index of the slice.
+        length : int
+            The length of the slice.
+
+        Returns
+        -------
+        np.ndarray
+            The sliced subarray.
+        """
         if dim == 0:
             return input[start : start + length]
         # elif dim == 1:
         #     return input[:, start : start + length]
 
-    def ad_fuller(self, series, maxlag=None):
+    def ad_fuller(
+        self, series: np.ndarray, maxlag: Optional[int] = None
+    ) -> Tuple[float, float]:
+        """
+        Performs the Augmented Dickey-Fuller (ADF) test on the given time series and returns
+        the test statistic and p-value.
+
+        Parameters
+        ----------
+        series : np.ndarray
+            The time series data to perform the ADF test on.
+        maxlag : int, optional
+            The maximum lag to use for the ADF test (default is calculated automatically).
+
+        Returns
+        -------
+        Tuple[float, float]
+            A tuple containing the test statistic and the p-value.
+        """
         """Get series and return the p-value and the t-stat of the coefficient"""
         if maxlag is None:
             n = int((len(series) - 1) ** (1.0 / 3))
@@ -135,9 +245,30 @@ class ADF_Test:
 
         return t_stat, p_value
 
-    def get_coeff_std_error(self, X, std_error, p):
-        """Receive the regression standard error
-        and calculate for the coefficient p"""
+    def get_coeff_std_error(
+        self, X: np.ndarray, std_error: float, p: np.ndarray
+    ) -> list:
+        """
+        Calculates the standard error for each coefficient in the regression.
+
+        This function computes the standard error for each coefficient by
+        using the formula: sqrt(Var(beta) * (s^2)), where Var(beta) is
+        the variance of the coefficient, and s^2 is the residual variance.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            The matrix of independent variables (shape: [n_samples, n_features]).
+        std_error : float
+            The regression standard error (calculated in `get_std_error`).
+        p : np.ndarray
+            The regression coefficients (shape: [n_features,]).
+
+        Returns
+        -------
+        list
+            A list of standard errors for each coefficient.
+        """
         std_coeff = []
         temp = np.linalg.inv(X.T @ X)
         for i in range(len(p)):
@@ -146,8 +277,30 @@ class ADF_Test:
             std_coeff.append(s)
         return std_coeff
 
-    def get_std_error(self, X, label, p):
-        """Get the regression standard error"""
+    def get_std_error(self, X: np.ndarray, label: np.ndarray, p: np.ndarray) -> float:
+        """
+        Calculates the standard error of the regression.
+
+        This function computes the standard error of the regression (also known
+        as the residual standard error), which is a measure of the variance of
+        the residuals. It is calculated using the formula:
+        sqrt(1/n * sum((y - y_pred)^2)) where y_pred is the predicted values
+        and y is the observed values.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            The matrix of independent variables (shape: [n_samples, n_features]).
+        label : np.ndarray
+            The observed dependent variable values (shape: [n_samples, 1]).
+        p : np.ndarray
+            The regression coefficients (shape: [n_features,]).
+
+        Returns
+        -------
+        float
+            The regression standard error.
+        """
         std_error = 0
         y_new = X @ p
         std_error = np.sum((label[:, 0] - y_new[:, 0]) ** 2)
