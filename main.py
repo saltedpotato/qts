@@ -1,3 +1,7 @@
+from datetime import datetime
+import pandas as pd
+import numpy as np
+from datetime import timedelta
 
 class PairsTrader:
     def __init__(self, df, pairs, lookback_period = 7, beta_freq = '1D'):
@@ -103,7 +107,6 @@ class PairsTrader:
             zscore = (spread - rolling_mean) / rolling_std
             self.df[z_col] = zscore
     
-            # 🔥 Vectorized signal logic using np.where
             signal_values = np.where(
                 zscore > entry_threshold, -1,
                 np.where(zscore < -entry_threshold, 1,
@@ -116,7 +119,7 @@ class PairsTrader:
 
     
     def simulate_trades(self, 
-                        trading_cost = 1.0, 
+                        trading_cost = 0.005, 
                         borrow_rate = 0.0001, 
                         stop_loss_threshold = -0.10):
  
@@ -148,7 +151,6 @@ class PairsTrader:
                 stonk2 = open_trade["stonk2"]
                 direction = open_trade["direction"]
                 
-                
                 r1 = row[f"ret_{stonk1}"]
                 r2 = row[f"ret_{stonk2}"]
                 
@@ -164,9 +166,9 @@ class PairsTrader:
                     long_leg_return = r2
                     short_leg_return = r1
     
-                short_cost = borrow_rate * short_price
+                short_cost = borrow_rate * short_price 
                 notional = cash
-                pnl = (long_leg_return - short_leg_return - short_cost) * notional
+                pnl = (long_leg_return - short_leg_return - short_cost) * notional * (1 - trading_cost)
                 cash += pnl
                 
                 #cache this shit
@@ -250,7 +252,6 @@ class PairsTrader:
                     }
     
                     have_position = True
-                    cash -= trading_cost
     
         # Finalize tracking columns
         idx_range = self.df.index[:len(position_col) + 1]
