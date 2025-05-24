@@ -1,7 +1,8 @@
 import datetime
 import polars as pl
+import numpy as np
 from typing import List, Optional
-from data.market_time import market_hours
+from utils.market_time import market_hours
 
 
 class market_data:
@@ -13,7 +14,7 @@ class market_data:
     ----------
     file_path : str
         Path to the directory where the parquet files are stored.
-    df : pl.DataFrame | None
+    df : pl.LazyFrame | None
         Polars DataFrame containing market data.
     market_timing : dict
         Dictionary containing market timings for both 'daylight' and 'normal' sessions.
@@ -34,7 +35,7 @@ class market_data:
         """
 
         self.file_path = file_path
-        self.df = None
+        self.df = pl.LazyFrame()
 
         self.market_timing = {
             market_hours.DAYLIGHT: {
@@ -65,16 +66,16 @@ class market_data:
                 self.times[market_hours.DAYLIGHT].append(time_only)
             current += datetime.timedelta(minutes=1)
 
-        self.times[market_hours.DAYLIGHT] = pl.DataFrame(
+        self.times[market_hours.DAYLIGHT] = pl.LazyFrame(
             {"time": self.times[market_hours.DAYLIGHT]}
         )
-        self.times[market_hours.NORMAL] = pl.DataFrame(
+        self.times[market_hours.NORMAL] = pl.LazyFrame(
             {"time": self.times[market_hours.NORMAL]}
         )
 
         self.full_date_time = None
 
-    def read(self, cons: List[str], start: str, end: str) -> pl.DataFrame:
+    def read(self, cons: List[str], start: str, end: str) -> bool:
         """
         Reads market data from parquet files, filters by date range, and prepares the final DataFrame.
 
@@ -89,8 +90,8 @@ class market_data:
 
         Returns:
         -------
-        pl.DataFrame
-            A Polars DataFrame containing the market data for the given symbols and date range.
+        bool
+            True if read successfully
         """
         year_to_read = list(set([start[:4], end[:4]]))
         pl_start = pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d")
@@ -149,6 +150,7 @@ class market_data:
             .collect()
             .pivot(on="symbol", index=["date", "time"], values="close")
             .sort(by=["date", "time"])
+            .lazy()
         )
 
         self.prep_time()
@@ -159,23 +161,37 @@ class market_data:
             )
             .fill_null(strategy="forward")
             .filter(pl.col("date") >= pl_start)
+        ).collect()
+
+        return True
+
+    def filter(self, resample_freq, hours):
+        df = self.filter_hours(hours=hours)
+        df = df.with_columns(
+            (pl.Series(name="max_time", values=np.array([0] * len(df)))),
+            (pl.Series(name="min_time", values=np.array([0] * len(df)))),
         )
+        df = self.resample_df(df=df, resample_freq=resample_freq)
 
-        return self.df.drop(["min_time", "max_time"])
+        return df
 
-    def resample_df(self, resample_freq: Optional[str] = None) -> pl.DataFrame:
+    def resample_df(
+        self, df: pl.DataFrame = None, resample_freq: Optional[str] = None
+    ) -> pl.DataFrame:
         """
         Resample the DataFrame (`self.df`) based on the specified frequency.
 
         Parameters
         ----------
+        df : pl.DataFrame, optional
+            DataFrame for filtering, if None, defaults to member variable
         resample_freq : str, optional
             The frequency to which the DataFrame should be resampled.
             If `None`, the DataFrame will not be resampled and the original DataFrame will be returned.
             Example frequencies include:
             - '1H' for hourly resampling
             - '30m' for 30-minute resampling
-            - '15T' for 15-minute resampling
+            - '15m' for 15-minute resampling
             - 'D' for daily resampling
 
         Returns
@@ -197,9 +213,11 @@ class market_data:
         # Display the resampled DataFrame
         print(resampled_df)
         """
+        if df is None:
+            df = self.df
         if resample_freq is not None:
             resampled_df = (
-                self.df.with_columns(
+                df.with_columns(
                     pl.col("time").dt.to_string().str.to_datetime("%H:%M:%S")
                 )
                 .upsample(
@@ -212,14 +230,18 @@ class market_data:
             )
 
             return resampled_df.drop(["min_time", "max_time"])
-        return self.df
+        return df
 
-    def filter_hours(self, hours: market_hours = market_hours.MARKET) -> pl.DataFrame:
+    def filter_hours(
+        self, df: pl.DataFrame = None, hours: market_hours = market_hours.MARKET
+    ) -> pl.DataFrame:
         """
         Filter the DataFrame (`self.df`) based on the specified market hours.
 
         Parameters
         ----------
+        df : pl.DataFrame, optional
+            DataFrame for filtering, if None, defaults to member variable
         hours : str, optional
             Defines the time period for filtering:
             - 'MARKET' (default) : Filters data during normal market hours.
@@ -237,8 +259,10 @@ class market_data:
         ValueError
             If the `hours` parameter is not one of 'MARKET', 'PRE', or 'POST'.
         """
+        if df is None:
+            df = self.df
         if hours == market_hours.MARKET:
-            filtered_df = self.df.filter(
+            filtered_df = df.filter(
                 (
                     pl.col("time")
                     >= pl.when(
@@ -285,7 +309,7 @@ class market_data:
             )
 
         elif hours == market_hours.PRE:
-            filtered_df = self.df.filter(
+            filtered_df = df.filter(
                 (
                     pl.col("time")
                     <= pl.when(
@@ -310,7 +334,7 @@ class market_data:
             )
 
         elif hours == market_hours.POST:
-            filtered_df = self.df.filter(
+            filtered_df = df.filter(
                 (
                     pl.col("time")
                     >= pl.when(
@@ -334,7 +358,7 @@ class market_data:
                 )
             )
         else:
-            raise ValueError("wrong timing")
+            filtered_df = df
 
         return filtered_df.drop(["min_time", "max_time"])
 

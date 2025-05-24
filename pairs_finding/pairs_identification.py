@@ -1,7 +1,7 @@
 import numpy as np
 from numba import prange, njit
 from numba.typed import List
-from adf import ADF_Test
+from pairs_finding.adf import ADF_Test
 from typing import Dict, Optional, Tuple
 
 

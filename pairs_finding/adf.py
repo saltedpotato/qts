@@ -235,15 +235,18 @@ class ADF_Test:
         X_ = np.concatenate((X_linreg, np.ones_like(ones_columns, dtype=np.float64)), 1)
 
         # Xb = y -> Xt.X.b = Xt.y -> b = (Xt.X)^-1.Xt.y
-        coeff = np.linalg.inv(X_.T @ X_) @ X_.T @ dX
+        if np.linalg.det(X_.T @ X_) != 0:
+            coeff = np.linalg.inv(X_.T @ X_) @ X_.T @ dX
 
-        std_error = self.get_std_error(X_, dX, coeff)
-        coeff_std_err = self.get_coeff_std_error(X_, std_error, coeff)[0]
-        t_stat = (coeff[0] / coeff_std_err).item()
+            std_error = self.get_std_error(X_, dX, coeff)
+            coeff_std_err = self.get_coeff_std_error(X_, std_error, coeff)[0]
+            t_stat = (coeff[0] / coeff_std_err).item()
 
-        p_value = self.mackinnonp(t_stat, N=1)
+            p_value = self.mackinnonp(t_stat, N=1)
 
-        return t_stat, p_value
+            return t_stat, p_value
+        else:
+            return 0.0, 1.0
 
     def get_coeff_std_error(
         self, X: np.ndarray, std_error: float, p: np.ndarray
