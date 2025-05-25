@@ -4,6 +4,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn import metrics
 from sklearn.cluster import KMeans, AgglomerativeClustering, AffinityPropagation, DBSCAN
 
+from utils.clustering_methods import Clustering_methods
+
 
 class Clustering:
     """
@@ -120,7 +122,7 @@ class Clustering:
 
     def evaluate(self, silhouette_score: list) -> int:
         """
-        Evaluates silhouette score reductions and returns the optimal cluster index.
+        Evaluates silhouette score and returns the optimal cluster index.
 
         Parameters
         ----------
@@ -132,19 +134,7 @@ class Clustering:
         int
             The optimal cluster index.
         """
-        percentage_reduction = [0] * 2  # There is no reduction for the first two points
-
-        for i in range(2, len(silhouette_score)):
-            reduction = (
-                (silhouette_score[i - 2] - silhouette_score[i])
-                / silhouette_score[i - 2]
-                * 100
-            )
-            percentage_reduction.append(reduction)
-
-            if reduction < self.reduction_threshold:
-                print(i - 1)
-                return i - 1
+        return np.argmax(silhouette_score)
 
     def kmeans_clustering(self, min_clusters: int = 5, max_clusters: int = 20) -> None:
         """
@@ -303,13 +293,13 @@ class Clustering:
         ValueError
             If the provided method is not one of "kmeans", "agnes", or "dbscan".
         """
-        if method == "kmeans":
+        if method == Clustering_methods.kmeans:
             return self.kmeans_clustering(**kwargs)
-        elif method == "agnes":
+        elif method == Clustering_methods.agnes:
             return self.agnes_clustering(**kwargs)
-        elif method == "dbscan":
+        elif method == Clustering_methods.dbscan:
             return self.dbscan_clustering(**kwargs)
-        elif method == "affinity_propagation":
+        elif method == Clustering_methods.dbscan:
             return self.affinity_propagation_clustering(**kwargs)
         else:
             raise ValueError(

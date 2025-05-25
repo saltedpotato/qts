@@ -379,7 +379,7 @@ class market_data:
 
         daylight_days = date_time.filter(
             pl.col("min_time")
-            == self.market_timing[market_hours.DAYLIGHT][market_hours.PRE]
+            < self.market_timing[market_hours.NORMAL][market_hours.PRE]
         )
         daylight_days = daylight_days.join(
             self.times[market_hours.DAYLIGHT], how="cross"
@@ -387,7 +387,7 @@ class market_data:
 
         normal_days = date_time.filter(
             pl.col("min_time")
-            == self.market_timing[market_hours.NORMAL][market_hours.PRE]
+            >= self.market_timing[market_hours.NORMAL][market_hours.PRE]
         )
         normal_days = normal_days.join(self.times[market_hours.NORMAL], how="cross")
 

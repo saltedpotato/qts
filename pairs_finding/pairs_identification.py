@@ -84,6 +84,7 @@ class cointegration_pairs:
         )
 
         self.pairs = dict(pairs)
+        self.sort_pairs()
 
     @staticmethod
     @njit(fastmath=True)
@@ -151,15 +152,15 @@ class cointegration_pairs:
             for cluster in range(n_clusters):
                 n_this_cluster = len(cluster_pairs[cluster])
                 if n_this_cluster != 1:
-                    for i in prange(start + n_this_cluster):
-                        x1_arr = df_arr[i]
-                        for j in range(start + i + 1, start + n_this_cluster + 1):
-                            x2_arr = df_arr[j]
+                    for i in prange(n_this_cluster):
+                        x1_arr = df_arr[start + i]
+                        for j in range(i + 1, n_this_cluster):
+                            x2_arr = df_arr[start + j]
                             if adf.ad_fuller(x1_arr) and adf.ad_fuller(x2_arr):
                                 resid = coint(x1=x1_arr, x2=x2_arr)
                                 t, pval = adf.ad_fuller(resid)
                                 if pval <= p_val_cutoff:
-                                    pairs[(tickers[i], tickers[j])] = t
+                                    pairs[(tickers[start + i], tickers[start + j])] = t
 
                 start += n_this_cluster
         else:
@@ -175,23 +176,13 @@ class cointegration_pairs:
                             pairs[(tickers[i], tickers[j])] = t
         return pairs
 
-    def get_top_pairs(self, n: int = 20) -> list[Tuple[str, str]]:
+    def sort_pairs(self):
         """
-        Retrieves the top N cointegrated pairs based on their cointegration test statistic.
-
-        Parameters
-        ----------
-        n : int, optional
-            The number of top pairs to retrieve (default is 20).
-
-        Returns
-        -------
-        list[Tuple[str, str]]
-            A list of the top N cointegrated pairs, sorted by their cointegration test statistic.
+        Sorts cointegrated pairs based on their cointegration test statistic.
         """
         if len(self.pairs) > 0:
             if self.cluster_pairs is not None:
-                top_pairs = {}
+                self.cluster_sorted_pairs = {}
                 self.cluster_pairs = list(self.cluster_pairs)
                 for i in range(len((self.cluster_pairs))):
                     tickers = self.cluster_pairs[i]
@@ -211,12 +202,10 @@ class cointegration_pairs:
 
                     pairs_with_t.sort(key=lambda x: x[0])
 
-                    top_pairs[i] = [
-                        (pair, t_value) for t_value, pair in pairs_with_t[:n]
+                    self.cluster_sorted_pairs[i] = [
+                        (pair, t_value) for t_value, pair in pairs_with_t
                     ]
 
-                return [pair[0] for sublist in top_pairs.values() for pair in sublist]
-            
             else:
                 self.pairs = {
                     k: v
@@ -226,4 +215,26 @@ class cointegration_pairs:
                     )
                 }
 
+    def get_top_pairs(self, n: int = 20) -> list[Tuple[str, str]]:
+        """
+        Retrieves the top N cointegrated pairs based on their cointegration test statistic.
+
+        Parameters
+        ----------
+        n : int, optional
+            The number of top pairs to retrieve (default is 20).
+
+        Returns
+        -------
+        list[Tuple[str, str]]
+            A list of the top N cointegrated pairs, sorted by their cointegration test statistic.
+        """
+        if len(self.pairs) > 0:
+            if self.cluster_pairs is not None:
+                return [
+                    pair[0]
+                    for sublist in self.cluster_sorted_pairs.values()
+                    for pair in sublist[:n]
+                ]
+            else:
                 return list(self.pairs.keys())[:n]

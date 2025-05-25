@@ -1,14 +1,35 @@
 import polars as pl
 import numpy as np
 from numba import njit, prange
+from typing import Any, Dict, Optional, List, Tuple
+
 from data.market_data import market_data
 from utils.params import PARAMS
 from utils.market_time import market_hours
 
 
 class PairsTrader:
+    """
+    Class for executing a pairs trading strategy.
+
+    Parameters
+    ----------
+    data : market_data
+        The market data source containing price and timestamp information.
+    pairs : list
+        List of tuples representing the asset pairs to trade.
+    params : dict
+        Dictionary containing strategy parameters for each pair.
+    trade_hour : market_hours, optional
+        Hours during which trading is allowed.
+    """
+
     def __init__(
-        self, data: market_data, pairs, params, trade_hour: market_hours = None
+        self,
+        data: market_data,
+        pairs: list[tuple[str, str]],
+        params: Dict[Any, Any],
+        trade_hour: market_hours = None,
     ):
         self.params = params
         self.data = data
@@ -17,13 +38,26 @@ class PairsTrader:
 
         self.pairs = pairs
 
-    def update_data(self, data):
+    def update_data(self, data: market_data):
+        """
+        Updates the internal data and filters by trading hours.
+
+        Parameters
+        ----------
+        data : market_data
+            The new market data.
+        """
         self.data = data
         self.df = data.filter_hours(hours=self.trade_hour).select(["date", "time"])
 
     def compute_beta(
         self,
     ):
+        """
+        Computes rolling beta for the selected pair using rolling covariance and variance.
+
+        Sets a new column in `self.resampled_df` with the computed beta.
+        """
         self.resampled_df = self.resampled_df.with_columns(
             (
                 pl.rolling_cov(
@@ -38,6 +72,11 @@ class PairsTrader:
         )
 
     def compute_spread(self):
+        """
+        Computes the spread between the two assets in a pair.
+
+        Sets a new column in `self.resampled_df` with the computed spread.
+        """
         self.resampled_df = self.resampled_df.with_columns(
             (
                 pl.col(self.p1)
@@ -46,6 +85,11 @@ class PairsTrader:
         )
 
     def compute_z_score(self):
+        """
+        Computes the z-score of the spread using a rolling window.
+
+        Sets a new column in `self.resampled_df` with the z-score.
+        """
         self.resampled_df = self.resampled_df.with_columns(
             (
                 (
@@ -61,6 +105,14 @@ class PairsTrader:
         )
 
     def compute_stock_returns(self) -> pl.LazyFrame:
+        """
+        Computes log returns of all stocks excluding the date and time columns.
+
+        Returns
+        -------
+        pl.LazyFrame
+            LazyFrame containing the log returns of all assets.
+        """
         returns_df = self.data.filter_hours(hours=self.trade_hour)
         returns_df = returns_df.with_columns(
             pl.all().exclude(["date", "time"]).log().diff()
@@ -70,8 +122,40 @@ class PairsTrader:
     @staticmethod
     @njit
     def compute_pos(
-        Z_arr, beta_arr, n_pairs, z_entry_arr, z_exit_arr, market_close_flag
-    ):
+        Z_arr: np.ndarray,
+        beta_arr: np.ndarray,
+        n_pairs: int,
+        z_entry_arr: np.ndarray,
+        z_exit_arr: np.ndarray,
+        market_close_flag: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Compute trading signals, positions, and associated betas for each pair.
+
+        Parameters
+        ----------
+        Z_arr : np.ndarray
+            Z-score time series, shape (n_rows, n_pairs).
+        beta_arr : np.ndarray
+            Estimated beta time series, shape (n_rows, n_pairs).
+        n_pairs : int
+            Number of trading pairs.
+        z_entry_arr : np.ndarray
+            Z-score entry thresholds for each pair, shape (n_pairs,).
+        z_exit_arr : np.ndarray
+            Z-score exit thresholds for each pair, shape (n_pairs,).
+        market_close_flag : np.ndarray
+            Binary flags indicating when to flatten positions, shape (n_rows,).
+
+        Returns
+        -------
+        signal_arr : np.ndarray
+            Trade signals (-1: short, 0: no signal, 1: long), shape (n_rows, n_pairs).
+        pos_arr : np.ndarray
+            Open position per pair (-1: short, 0: flat, 1: long), shape (n_rows, n_pairs).
+        pos_beta_arr : np.ndarray
+            Position beta value when open, 0 otherwise, shape (n_rows, n_pairs).
+        """
         n_rows = Z_arr.shape[0]
 
         signal_arr = np.zeros((n_rows, n_pairs))  # shape: n rows, n pairs
@@ -115,14 +199,16 @@ class PairsTrader:
                     (prev_pos == 0)
                     & (curr_signal == -1)
                     & (~np.isnan(curr_beta))
-                    & (market_close_flag[i] == 0),
+                    & (market_close_flag[i] == 0)
+                    & ((-2 <= curr_beta) & (curr_beta <= 2)),  # restrict beta
                     -1,
                     np.where(
                         # if no pos and long spread and market not close
                         (prev_pos == 0)
                         & (curr_signal == 1)
                         & (~np.isnan(curr_beta))
-                        & (market_close_flag[i] == 0),
+                        & (market_close_flag[i] == 0)
+                        & ((-2 <= curr_beta) & (curr_beta <= 2)),
                         1,
                         prev_pos,  # unchanged pos
                     ),
@@ -145,7 +231,30 @@ class PairsTrader:
 
     @staticmethod
     @njit
-    def capital_allocation_ret(pair_ret_arr, pos_arr, n_pairs):
+    def capital_allocation_ret(
+        pair_ret_arr: np.ndarray, pos_arr: np.ndarray, n_pairs: int, cost: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute capital allocation and capital over time.
+
+        Parameters
+        ----------
+        pair_ret_arr : np.ndarray
+            Returns per pair, shape (n_rows, n_pairs).
+        pos_arr : np.ndarray
+            Position matrix (-1, 0, 1), shape (n_rows, n_pairs).
+        n_pairs : int
+            Number of pairs.
+        cost : float
+            market impact per entry/exit as a proportion (e.g. 0.001 for 0.1%).
+
+        Returns
+        -------
+        capital_allocation_arr : np.ndarray
+            Capital allocated per pair over time, shape (n_rows, n_pairs).
+        remaining_capital : np.ndarray
+            Remaining float capital not currently deployed, shape (n_rows,).
+        """
         n_rows = pos_arr.shape[0]
         capital_allocation_arr = np.zeros((n_rows, n_pairs))  # shape: n rows, n pairs
         remaining_capital = np.ones(n_rows)
@@ -162,8 +271,10 @@ class PairsTrader:
                 for j in prange(n_pairs):
                     if close_pos[j] == 1:
                         this_remaining_capital += (
-                            1 + pair_ret_arr[i][j]
-                        ) * capital_allocation_arr[i - 1][j]
+                            (1 + pair_ret_arr[i][j])
+                            * capital_allocation_arr[i - 1][j]
+                            * (1 - cost)
+                        )
                         capital_allocation_arr[i - 1][j] = 0
 
             if np.any(new_pos):
@@ -171,7 +282,9 @@ class PairsTrader:
                 deployable_capital = (this_remaining_capital) / sum(new_pos)
                 for j in prange(n_pairs):
                     if new_pos[j] == 1:
-                        capital_allocation_arr[i - 1][j] = deployable_capital
+                        capital_allocation_arr[i - 1][j] = deployable_capital * (
+                            1 - cost
+                        )
                         this_remaining_capital -= deployable_capital
             # float capital returns
             capital_allocation_arr[i] = (1 + pair_ret_arr[i]) * capital_allocation_arr[
@@ -182,7 +295,18 @@ class PairsTrader:
 
         return capital_allocation_arr, remaining_capital
 
-    def generate_backtest_df(self):
+    def generate_backtest_df(self) -> pl.DataFrame:
+        """
+        Generate a backtest dataframe by computing beta, spread, and z-score for each pair.
+
+        Resamples the raw market data for each pair's trading frequency,
+        calculates indicators, and joins them into a unified dataframe.
+
+        Returns
+        -------
+        pl.DataFrame
+            A merged dataframe containing all computed columns across pairs.
+        """
         df = self.df
         # each pair has different trading freq, loop and resample to compute beta and Zs
         for pair in self.pairs:
@@ -206,7 +330,29 @@ class PairsTrader:
             del self.resampled_df
         return df
 
-    def backtest(self, start, end):
+    def backtest(
+        self,
+        start: pl.Expr,
+        end: pl.Expr,
+        cost: float = 0.0005,
+    ) -> pl.DataFrame:
+        """
+        Run the pairs trading backtest using defined strategy parameters and signals.
+
+        Parameters
+        ----------
+        start : pl.Expr
+        Polars expression for start filter (e.g., pl.col("date") >= some_date).
+        end : pl.Expr
+            Polars expression for end filter (e.g., pl.col("date") <= some_date).
+        cost : float, optional
+            Transaction cost per entry/exit (default is 0.0005, or 0.05%).
+
+        Returns
+        -------
+        pl.DataFrame
+            The final dataframe containing trades, positions, returns, and capital evolution.
+        """
         returns = self.compute_stock_returns().filter(
             pl.col("date").is_between(start, end)
         )
@@ -311,6 +457,7 @@ class PairsTrader:
             ).to_numpy(),
             pos_arr=pos_arr,
             n_pairs=len(self.pairs),
+            cost=cost,
         )
         backtest_df = pl.concat(
             [

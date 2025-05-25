@@ -50,13 +50,6 @@ class get_cons:
                 etfg_constituents.constituents
             WHERE 
                 composite_ticker = '{self.etf}'
-                AND (
-                    -- Match quarter-end dates
-                    (EXTRACT(MONTH FROM as_of_date) = 3 AND EXTRACT(DAY FROM as_of_date) = 31) OR  -- March 31
-                    (EXTRACT(MONTH FROM as_of_date) = 6 AND EXTRACT(DAY FROM as_of_date) = 30) OR  -- June 30
-                    (EXTRACT(MONTH FROM as_of_date) = 9 AND EXTRACT(DAY FROM as_of_date) = 30) OR  -- September 30
-                    (EXTRACT(MONTH FROM as_of_date) = 12 AND EXTRACT(DAY FROM as_of_date) = 31)     -- December 31
-                )
             ORDER BY 
                 as_of_date;
 
