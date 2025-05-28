@@ -35,7 +35,8 @@ class market_data:
         """
 
         self.file_path = file_path
-        self.df = pl.LazyFrame()
+        self.pq_scanner = pl.scan_parquet(file_path, rechunk=True)
+        self.df = None
 
         self.market_timing = {
             market_hours.DAYLIGHT: {
@@ -93,44 +94,18 @@ class market_data:
         bool
             True if read successfully
         """
-        year_to_read = list(set([start[:4], end[:4]]))
         pl_start = pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d")
         pl_end = pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d")
 
-        if len(year_to_read) > 1:
-            df = pl.concat(
+        self.df = (
+            self.pq_scanner.select(
                 [
-                    pl.read_parquet(
-                        f"{self.file_path}{year_to_read[0]}.parquet",
-                        columns=[
-                            "ts_event",
-                            "close",
-                            "symbol",
-                        ],
-                    ),
-                    pl.read_parquet(
-                        f"{self.file_path}{year_to_read[1]}.parquet",
-                        columns=[
-                            "ts_event",
-                            "close",
-                            "symbol",
-                        ],
-                    ),
-                ],
-                how="vertical",
-            ).lazy()
-        else:
-            df = pl.read_parquet(
-                f"{self.file_path}{year_to_read[0]}.parquet",
-                columns=[
                     "ts_event",
                     "close",
                     "symbol",
-                ],
-            ).lazy()
-
-        self.df = (
-            df.with_columns(date=pl.col("ts_event").str.strptime(pl.Datetime))
+                ]
+            )
+            .with_columns(date=pl.col("ts_event").str.strptime(pl.Datetime))
             .with_columns(
                 date=pl.col("date").dt.date(),
                 time=pl.col("date").dt.time(),
@@ -147,7 +122,7 @@ class market_data:
                     & (pl.col("symbol").is_in(cons))
                 )
             )
-            .collect()
+            .collect(streaming=True)
             .pivot(on="symbol", index=["date", "time"], values="close")
             .sort(by=["date", "time"])
             .lazy()
