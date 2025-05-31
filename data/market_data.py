@@ -100,15 +100,14 @@ class market_data:
         self.df = (
             self.pq_scanner.select(
                 [
-                    "ts_event",
+                    "t",
                     "close",
                     "symbol",
                 ]
             )
-            .with_columns(date=pl.col("ts_event").str.strptime(pl.Datetime))
             .with_columns(
-                date=pl.col("date").dt.date(),
-                time=pl.col("date").dt.time(),
+                date=pl.col("t").dt.date(),
+                time=pl.col("t").dt.time(),
             )
             .filter(
                 (

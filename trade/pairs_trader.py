@@ -95,11 +95,11 @@ class PairsTrader:
                 (
                     pl.col(f"SPREAD_{self.p1}_ON_{self.p2}")
                     - pl.col(f"SPREAD_{self.p1}_ON_{self.p2}").rolling_mean(
-                        window_size=self.this_param[PARAMS.z_win]
+                        window_size=self.this_param[PARAMS.z_win_mean]
                     )
                 )
                 / pl.col(f"SPREAD_{self.p1}_ON_{self.p2}").rolling_std(
-                    window_size=self.this_param[PARAMS.z_win]
+                    window_size=self.this_param[PARAMS.z_win_std]
                 )
             ).alias(f"Z_{self.p1}_ON_{self.p2}")
         )
@@ -200,7 +200,7 @@ class PairsTrader:
                     & (curr_signal == -1)
                     & (~np.isnan(curr_beta))
                     & (market_close_flag[i] == 0)
-                    & ((-2 <= curr_beta) & (curr_beta <= 2)),  # restrict beta
+                    & (np.abs(curr_beta) <= 2),  # restrict beta
                     -1,
                     np.where(
                         # if no pos and long spread and market not close
@@ -208,7 +208,7 @@ class PairsTrader:
                         & (curr_signal == 1)
                         & (~np.isnan(curr_beta))
                         & (market_close_flag[i] == 0)
-                        & ((-2 <= curr_beta) & (curr_beta <= 2)),
+                        & (np.abs(curr_beta) <= 2),
                         1,
                         prev_pos,  # unchanged pos
                     ),
@@ -232,7 +232,11 @@ class PairsTrader:
     @staticmethod
     @njit
     def capital_allocation_ret(
-        pair_ret_arr: np.ndarray, pos_arr: np.ndarray, n_pairs: int, cost: float
+        pair_ret_arr: np.ndarray,
+        pos_arr: np.ndarray,
+        n_pairs: int,
+        cost: float,
+        stop_loss: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute capital allocation and capital over time.
@@ -247,6 +251,8 @@ class PairsTrader:
             Number of pairs.
         cost : float
             market impact per entry/exit as a proportion (e.g. 0.001 for 0.1%).
+        stop_loss : np.ndarray
+            interval returns stop loss, stop trading the pair for the month if hit (e.g. 0.001 for 0.1%).
 
         Returns
         -------
@@ -264,18 +270,32 @@ class PairsTrader:
             new_pos = ((prev_pos == 0) & (pos_arr[i] != 0)).astype(np.int32)
             close_pos = ((prev_pos != 0) & (pos_arr[i] == 0)).astype(np.int32)
 
+            # check stops
+            SL = np.where(
+                capital_allocation_arr[i - 2] == 0,
+                0,
+                capital_allocation_arr[i - 1] / capital_allocation_arr[i - 2] - 1,
+            )
+
+            SL = np.where(SL <= -stop_loss, 1, 0)
+
             this_remaining_capital = remaining_capital[i - 1]
 
-            if np.any(close_pos):
-                # if close position, return capital
+            if np.any(close_pos) or np.any(SL):
+                # if close position or stoploss hit, return capital
                 for j in prange(n_pairs):
-                    if close_pos[j] == 1:
+                    if close_pos[j] == 1 or SL[j] == 1:
                         this_remaining_capital += (
                             (1 + pair_ret_arr[i][j])
                             * capital_allocation_arr[i - 1][j]
                             * (1 - cost)
                         )
                         capital_allocation_arr[i - 1][j] = 0
+                    if SL[j] == 1:  # stop trading the pair for the month
+                        pos_arr = pos_arr.T
+                        pos_arr[j][i:] = 0
+                        pos_arr = pos_arr.T
+                        new_pos[j] = 0
 
             if np.any(new_pos):
                 # if multiple signals, then equally divide capital
@@ -335,6 +355,7 @@ class PairsTrader:
         start: pl.Expr,
         end: pl.Expr,
         cost: float = 0.0005,
+        stop_loss: np.ndarray = None,
     ) -> pl.DataFrame:
         """
         Run the pairs trading backtest using defined strategy parameters and signals.
@@ -347,6 +368,8 @@ class PairsTrader:
             Polars expression for end filter (e.g., pl.col("date") <= some_date).
         cost : float, optional
             Transaction cost per entry/exit (default is 0.0005, or 0.05%).
+        stop_loss : np.ndarray
+            interval returns stop loss, stop trading the pair for the month if hit (e.g. 0.001 for 0.1%).
 
         Returns
         -------
@@ -451,6 +474,8 @@ class PairsTrader:
             .fill_null(0)
         )
 
+        if stop_loss is None:
+            stop_loss = np.array([1e6] * len(self.pairs))
         capital_allocation_arr, remaining_capital = self.capital_allocation_ret(
             pair_ret_arr=backtest_df.select(
                 [col for col in backtest_df.columns if "PAIR_RET" in col]
@@ -458,6 +483,7 @@ class PairsTrader:
             pos_arr=pos_arr,
             n_pairs=len(self.pairs),
             cost=cost,
+            stop_loss=stop_loss,
         )
         backtest_df = pl.concat(
             [

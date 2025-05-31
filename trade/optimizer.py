@@ -1,5 +1,6 @@
 import optuna
 from optuna.samplers import TPESampler
+import optuna.study.study
 import polars as pl
 import numpy as np
 from typing import Any, Dict
@@ -58,26 +59,42 @@ class optimizer:
         params = {
             (p1, p2): {
                 PARAMS.beta_win: trial.suggest_int(
-                    f"{p1}_{p2}_beta_win", 10, 1_000, step=10
+                    f"{p1}_{p2}_beta_win", 10, 500, step=5
                 ),
                 # PARAMS.beta_freq: "1d",  # Assuming this is fixed as you mentioned
-                PARAMS.z_win: trial.suggest_int(f"{p1}_{p2}_z_win", 10, 1_000, step=10),
+                PARAMS.z_win_mean: trial.suggest_int(
+                    f"{p1}_{p2}_z_win_mean", 10, 500, step=5
+                ),
+                PARAMS.z_win_std: trial.suggest_int(
+                    f"{p1}_{p2}_z_win_std", 10, 500, step=5
+                ),
                 PARAMS.z_entry: trial.suggest_float(
-                    f"{p1}_{p2}_z_entry", 0, 3.5, step=0.1
+                    f"{p1}_{p2}_z_entry", 1, 3.5, step=0.1
                 ),
                 PARAMS.z_exit: trial.suggest_float(
-                    f"{p1}_{p2}_z_exit", -3.5, 0, step=0.1
+                    f"{p1}_{p2}_z_exit", -3.5, -1, step=0.1
                 ),
                 PARAMS.trade_freq: trial.suggest_categorical(
                     f"{p1}_{p2}_trade_freq",
-                    [str(i) + "m" for i in range(1, 60)],
+                    [str(i) + "m" for i in range(1, 15)],
                 ),
+                # PARAMS.stop_loss: trial.suggest_float(
+                #     f"{p1}_{p2}_stop_loss", 0.001, 0.01, step=0.001
+                # ),
             }
             for p1, p2 in pairs
         }
 
         self.backtester.params = params
-        bt_df = self.backtester.backtest(start=self.start, end=self.end, cost=0.0005)
+        bt_df = self.backtester.backtest(
+            start=self.start,
+            end=self.end,
+            cost=0.0005,
+            stop_loss=None 
+            # np.array(
+            #     [params[(p1, p2)][PARAMS.stop_loss] for p1, p2 in pairs]
+            # ),
+        )
         bt_df = (
             bt_df.select("CAPITAL")
             .with_columns(pl.all().pct_change())
@@ -90,7 +107,7 @@ class optimizer:
 
         return sharpe
 
-    def optimize(self, n_trials: int = 200) -> Dict[str, Any]:
+    def optimize(self, n_trials: int = 200) -> optuna.study.study:
         """
         Runs Optuna optimization over the defined search space.
 
@@ -101,10 +118,15 @@ class optimizer:
 
         Returns
         -------
-        Dict[str, Any]
-            Dictionary of the best hyperparameters found.
+        optuna.study.study
+            study object
         """
-        sampler = TPESampler(seed=627)
+        sampler = TPESampler(seed=621)
         study = optuna.create_study(direction="maximize", sampler=sampler)
-        study.optimize(self.objective, n_trials=n_trials, show_progress_bar=True)
-        return study.best_params
+        study.optimize(
+            self.objective,
+            n_trials=n_trials,
+            show_progress_bar=True,
+            gc_after_trial=True,
+        )
+        return study
