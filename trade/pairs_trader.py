@@ -95,14 +95,59 @@ class PairsTrader:
                 (
                     pl.col(f"SPREAD_{self.p1}_ON_{self.p2}")
                     - pl.col(f"SPREAD_{self.p1}_ON_{self.p2}").rolling_mean(
-                        window_size=self.this_param[PARAMS.z_win_mean]
+                        window_size=self.this_param[PARAMS.z_win]
                     )
                 )
                 / pl.col(f"SPREAD_{self.p1}_ON_{self.p2}").rolling_std(
-                    window_size=self.this_param[PARAMS.z_win_std]
+                    window_size=self.this_param[PARAMS.z_win]
                 )
             ).alias(f"Z_{self.p1}_ON_{self.p2}")
         )
+
+    @staticmethod
+    @njit
+    def hurst_exponent_fast(ts):
+        N = len(ts)
+        max_k = N // 2
+        lags = np.logspace(np.log10(10), np.log10(max_k), num=20).astype(np.int64)
+
+        RS = np.empty(len(lags))
+
+        for i in prange(len(lags)):
+            lag = lags[i]
+            n_blocks = N // lag
+            R_S_vals = np.zeros(n_blocks)
+
+            for j in range(n_blocks):
+                start = j * lag
+                end = start + lag
+                segment = ts[start:end]
+                mean_seg = np.mean(segment)
+                Z = np.cumsum(segment - mean_seg)
+                R = np.max(Z) - np.min(Z)
+                S = np.std(segment)
+                R_S_vals[j] = R / S if S > 0 else 0
+
+            RS[i] = np.mean(R_S_vals)
+
+        log_lags = np.log(lags)
+        log_RS = np.log(RS + 1e-8)  # avoid log(0)
+
+        # Linear regression using least squares
+        A = np.vstack((log_lags, np.ones_like(log_lags))).T
+        slope, _ = np.linalg.lstsq(A, log_RS)[0]
+
+        return slope
+
+    @staticmethod
+    @njit
+    def compute_rolling_hurst(ts, window_size, hurst_func):
+        n = len(ts)
+        hursts = np.zeros(n)
+        for i in prange(window_size - 1, n):
+            window = ts[i - window_size + 1 : i + 1]
+            hursts[i] = hurst_func(window)
+        return hursts
 
     def compute_stock_returns(self) -> pl.LazyFrame:
         """
@@ -124,6 +169,7 @@ class PairsTrader:
     def compute_pos(
         Z_arr: np.ndarray,
         beta_arr: np.ndarray,
+        hurst_arr: np.ndarray,
         n_pairs: int,
         z_entry_arr: np.ndarray,
         z_exit_arr: np.ndarray,
@@ -166,20 +212,21 @@ class PairsTrader:
             curr_Z = Z_arr[i]
             prev_pos = pos_arr[i - 1]
             curr_beta = beta_arr[i]
+            is_MR = True
 
-            long_cond = curr_Z > z_entry_arr
-            short_cond = curr_Z < -z_entry_arr
+            long_cond = curr_Z < -z_entry_arr
+            short_cond = curr_Z > z_entry_arr
 
             signal_arr[i] = np.where(
-                (long_cond) & (~np.isnan(curr_Z)),
+                ((long_cond) & (~np.isnan(curr_Z)) & (is_MR)),
                 1,
-                np.where((short_cond) & (~np.isnan(curr_Z)), -1, 0),
+                np.where(((short_cond) & (~np.isnan(curr_Z)) & (is_MR)), -1, 0),
             )
 
             curr_signal = signal_arr[i]
 
-            exit_long_cond = curr_Z <= z_exit_arr
-            exit_short_cond = curr_Z >= -z_exit_arr
+            exit_long_cond = curr_Z > z_exit_arr
+            exit_short_cond = curr_Z < -z_exit_arr
 
             pos_arr[i] = np.where(
                 (
@@ -283,19 +330,22 @@ class PairsTrader:
 
             if np.any(close_pos) or np.any(SL):
                 # if close position or stoploss hit, return capital
-                for j in prange(n_pairs):
-                    if close_pos[j] == 1 or SL[j] == 1:
+                for pair in prange(n_pairs):
+                    if close_pos[pair] == 1 or SL[pair] == 1:
                         this_remaining_capital += (
-                            (1 + pair_ret_arr[i][j])
-                            * capital_allocation_arr[i - 1][j]
+                            (1 + pair_ret_arr[i][pair])
+                            * capital_allocation_arr[i - 1][pair]
                             * (1 - cost)
                         )
-                        capital_allocation_arr[i - 1][j] = 0
-                    if SL[j] == 1:  # stop trading the pair for the month
+                        capital_allocation_arr[i - 1][pair] = 0
+                    if SL[pair] == 1:  # stop trading the pair for this period
                         pos_arr = pos_arr.T
-                        pos_arr[j][i:] = 0
+                        for future_pos in range(i, n_rows):
+                            if pos_arr[pair][future_pos] == 0:
+                                break
+                            pos_arr[pair][future_pos] = 0
                         pos_arr = pos_arr.T
-                        new_pos[j] = 0
+                        new_pos[pair] = 0
 
             if np.any(new_pos):
                 # if multiple signals, then equally divide capital
@@ -338,6 +388,16 @@ class PairsTrader:
             self.this_param = self.params[(self.p1, self.p2)]
             self.compute_beta()
             self.compute_spread()
+            hurst = self.compute_rolling_hurst(
+                ts=self.resampled_df.select(f"SPREAD_{self.p1}_ON_{self.p2}")
+                .to_numpy()
+                .flatten(),
+                window_size=self.params[(self.p1, self.p2)][PARAMS.hurst_win],
+                hurst_func=self.hurst_exponent_fast,
+            )
+            self.resampled_df = self.resampled_df.with_columns(
+                pl.Series(name=f"HURST_{self.p1}_ON_{self.p2}", values=hurst)
+            )
             self.compute_z_score()
 
             df = df.join(
@@ -404,6 +464,11 @@ class PairsTrader:
             [f"BETA_{p1}_ON_{p2}" for p1, p2 in self.pairs]
         ).to_numpy()  # shape: n rows, n pairs
 
+        hurst_arr = df.select(
+            # select reorders the columns
+            [f"HURST_{p1}_ON_{p2}" for p1, p2 in self.pairs]
+        ).to_numpy()  # shape: n rows, n pairs
+
         market_close_flag = df.select("market_close").to_numpy().flatten()
 
         z_entry_arr = np.array(
@@ -414,6 +479,7 @@ class PairsTrader:
         signal_arr, pos_arr, pos_beta_arr = self.compute_pos(
             Z_arr=Z_arr,
             beta_arr=beta_arr,
+            hurst_arr=hurst_arr,
             n_pairs=len(self.pairs),
             z_entry_arr=z_entry_arr,
             z_exit_arr=z_exit_arr,
@@ -436,7 +502,13 @@ class PairsTrader:
 
         backtest_df = (
             pl.concat(
-                [returns, signal_df, pos_df, pos_beta_df],
+                [
+                    returns,
+                    df.drop(["date", "time"]),
+                    signal_df,
+                    pos_df,
+                    pos_beta_df,
+                ],
                 how="horizontal",
             )
             .with_columns(

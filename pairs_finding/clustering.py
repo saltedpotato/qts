@@ -182,7 +182,7 @@ class Clustering:
         silhouette_score = []
 
         for k in range(min_clusters, max_clusters):
-            agnes = AgglomerativeClustering(n_clusters=k)
+            agnes = AgglomerativeClustering(n_clusters=k, linkage="average")
             agnes.fit(self.scaler)
             silhouette_score.append(
                 metrics.silhouette_score(
