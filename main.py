@@ -1,273 +1,288 @@
-from datetime import datetime
-import pandas as pd
-import numpy as np
-from datetime import timedelta
 
-class PairsTrader:
-    def __init__(self, df, pairs, lookback_period = 7, beta_freq = '1D'):
-        """
-        INPUTS TO THIS BAD ASS MTFKER
-        df = wide df like roh's usual. cols names r symbols
-        pairs = from edmunds pair output is list of tuples [('CRWD', 'DXCM'), ('AMD', 'IDXX')]
-        lookback_period for # of days for the OLS beta calculations
-        beta_freq = frequency to use for beta calc. just leave as 1D
-        """
-        self.df = df.copy()
-        self.pairs = pairs
-        self.lookback_period = lookback_period
-        self.beta_freq = beta_freq
-        self.df.index = pd.to_datetime(self.df.index)
-        self.capital = 1000
+class PairsBacktester:
 
+    @staticmethod
+    @njit
+    def rolling_beta(x: np.ndarray, y: np.ndarray, beta_window: int) -> np.ndarray:
+        """
+        calc rolling beta
+        used in compute_zscore! dont call it yoself
 
-    def calc_beta_series(self, stonk1, stonk2):
+        Parameters
+        ----------
+        x : np.ndarray
+            time series of asset x.
+        y : np.ndarray
+            time series of asset y.
+        beta_window : int
+            number of periods for rolling window.
+
+        Returns
+        -------
+        np.ndarray
+            rolling beta values aligned with x and y.
         """
-        CALS THE BETA FOR LOOKBACK PERIOD BEFORE CURRENT DAY NOT LOOK AHEAD BIAS
-        RETURNS A PD SERIES 
+        n = x.shape[0]
+        beta = np.full(n, np.nan)
+        if n < beta_window:
+            return beta
+
+        stride = x.strides[0]
+        x_rolling = as_strided(x, shape=(n - beta_window + 1, beta_window), strides=(stride, stride))
+        y_rolling = as_strided(y, shape=(n - beta_window + 1, beta_window), strides=(stride, stride))
+
+        for i in range(n - beta_window + 1):
+            x_win = x_rolling[i]
+            y_win = y_rolling[i]
+            mean_x = x_win.mean()
+            mean_y = y_win.mean()
+            cov = ((x_win - mean_x) * (y_win - mean_y)).mean()
+            var = ((x_win - mean_x) ** 2).mean()
+            beta[i + beta_window - 1] = cov / var if var > 0 else np.nan
+
+        return beta
+
+    @staticmethod
+    @njit
+    def compute_zscore(x: np.ndarray, y: np.ndarray, beta_window: int, zscore_window: int) -> tuple[np.ndarray, np.ndarray]:
         """
+        compute spread and zscore
+
+        Parameters
+        ----------
+        x : np.ndarray
+            time series of asset x
+        y : np.ndarray
+            time series of asset y
+        beta_window : int
+            rolling window size for computing beta
+        zscore_window : int
+            rolling window size for zscore computation
+
+        Returns
+        -------
+        tuple
+            zscore : zscore of spread.
+            spread : raw spread values.
+        """
+        n = x.shape[0]
+        zscore = np.full(n, np.nan)
+        spread = np.full(n, np.nan)
+
+        beta = PairsBacktester.rolling_beta(x, y, beta_window)
+
+        for i in range(n):
+            if not np.isnan(beta[i]):
+                spread[i] = y[i] - beta[i] * x[i]
+
+        if n < zscore_window:
+            return zscore, spread
+
+        stride = spread.strides[0]
+        spread_rolling = as_strided(spread, shape=(n - zscore_window + 1, zscore_window), strides=(stride, stride))
+
+        for i in range(n - zscore_window + 1):
+            window = spread_rolling[i]
+            mean = window.mean()
+            std = window.std()
+            if std > 0:
+                zscore[i + zscore_window - 1] = (spread[i + zscore_window - 1] - mean) / std
+
+        return zscore, spread
+
+    @staticmethod
+    @njit
+    def check_new_entries(zscores: np.ndarray, positions_tm1: np.ndarray, entry_threshold: float,
+                           max_active_pairs: int, method: str = "equal", cash_available: float = 1.0) -> np.ndarray:
+        """
+        find and allocate capital to new signals based on zscores
+        used in backtest_weights_loop !
         
-        ## RESAMPLE TO THE TIMEFRAME YOU WANT. DEFAULT 1 DAY OK JUST ADD MORE DAYS
-        resampled = df[[stonk1, stonk2]].resample(self.beta_freq).last().dropna() # DROP THEM WEEKENDS
-        beta_series = pd.Series(index = resampled.index)
-        
-        for current_time in resampled.index:
-            window_start = current_time - timedelta(days = self.lookback_period)
-            window_data = resampled.loc[(resampled.index >= window_start) & (resampled.index < current_time)] # LESS THAN SO NO LOOK AHEAD BIAS BITCH
 
-            if window_data.empty:
-                continue
+        Parameters
+        ----------
+        zscores : np.ndarray
+            signal array for all pairs.
+        positions_tm1 : np.ndarray
+            position array from previous time step.
+        entry_threshold : float
+            entry entry theshold
+        max_active_pairs : int
+            max number of allowed positions
+        method : str
+            weighting method. 
+            ('equal' or 'yolo')
+        cash_available : float
+            aamt of cash
 
-            days_covered = (window_data.index.max() - window_data.index.min()).days
-
-            if days_covered < self.lookback_period - 1:
-                continue
-            
-            cov = window_data[stonk1].cov(window_data[stonk2])
-            var = window_data[stonk2].var()
-            
-            if var == 0 or np.isnan(cov) or np.isnan(var):
-                continue
-    
-            beta_series[current_time] = cov / var
-    
-        return beta_series.ffill().dropna()
-
-    def merge_beta_df_time(self, beta_series):
+        Returns
+        -------
+        allocations : np.ndarray
+            wgts allocated to new entries.
         """
-        CREATES THEM TIMESERIES IN BETA SERIES TO ALIGN WITH MAIN DF
-        """
-        
-        beta_reindexed = beta_series.reindex(self.df.index, method = "ffill")
-        
-        return beta_reindexed
+        N = zscores.shape[0]
+        allocations = np.zeros(N)
 
-    def calc_beta_and_spread(self):
-        """
-        FOR EACH TUPLE OF STONK PAIRS, COMPUTE HEDGE RATIO AND SPREAD AND APPEND TO THE MAIN DF
-        """
-        output_cols = []
-        
-        for stonk1, stonk2 in self.pairs:
-            
-            beta_series = self.calc_beta_series(stonk1, stonk2)
-            beta_reindexed = self.merge_beta_df_time(beta_series)
+        is_new = (positions_tm1 == 0) & (np.abs(zscores) > entry_threshold)
+        num_current_open = np.sum(positions_tm1)
+        slots_available = max_active_pairs - num_current_open
 
-            # fuk this idk how to label the pairs tgt just gonna do this
-            beta_col = "beta_" + str(stonk1) + "_" + str(stonk2)
-            spread_col = "spread_" + str(stonk1) + "_" + str(stonk2)
+        if slots_available <= 0:
+            return allocations
 
-            self.df[beta_col] = beta_reindexed
-            self.df[spread_col] = self.df[stonk1] - beta_reindexed * self.df[stonk2]
+        candidate_indices = np.where(is_new)[0]
 
-            output_cols.extend([stonk1, stonk2, beta_col, spread_col])
-            
-        output_cols = list(set(output_cols))
-        
-        self.df = self.df[output_cols].dropna() # drop all periods where not warmed up
+        if len(candidate_indices) > slots_available:
+            ranked_idx = np.argsort(-np.abs(zscores))
+            selected_idx = []
+            for i in ranked_idx:
+                if is_new[i]:
+                    selected_idx.append(i)
+                    if len(selected_idx) >= slots_available:
+                        break
+        else:
+            selected_idx = candidate_indices
 
-    def calc_zscore_signals(self, z_window  = 60, entry_threshold = 2.0, exit_threshold = 0.5):
+        if method == "equal":
+            fixed_alloc = 1.0 / max_active_pairs
+            for i in selected_idx:
+                allocations[i] = fixed_alloc
+
+        elif method == "yolo":
+            if len(selected_idx) > 0:
+                allocations[selected_idx[0]] = cash_available
+
+        return allocations
+
+    @staticmethod
+    @njit
+    def compute_portfolio_weights(price_t: np.ndarray, price_tm1: np.ndarray, weights_tm1: np.ndarray,
+                                  positions_t: np.ndarray, new_allocations: np.ndarray) -> tuple[np.ndarray, float]:
         """
-        CALCULATES Z-SCORE OF SPREAD FOR EACH PAIR AND GENERATES ENTRY/EXIT SIGNALS
-        
-        z_window: how many time periods to use for rolling mean/std
-        entry_threshold & exit_threshold: z-score to enter and exit 
-        
+        update portf wgts by floating + entries.
+        used in backtest_weights_loop !
+
+        Parameters
+        ----------
+        price_t : np.ndarray
+            prices at current time T
+        price_tm1 : np.ndarray
+            prices at previous time T-1
+        weights_tm1 : np.ndarray
+            wgts from t-1
+        positions_t : np.ndarray
+            current open positions
+        new_allocations : np.ndarray
+            capital to assign if new position
+
+        Returns
+        -------
+        portfolio_weights : np.ndarray
+            portf wgts
+        sum_floated_weights : float
+            portfolio value
         """
-        
-        for stonk1, stonk2 in self.pairs:
-            spread_col = "spread_" + str(stonk1) + "_" + str(stonk2)
-            z_col = "zscore_" + str(stonk1) + "_" + str(stonk2)
-            signal_col = "signal_" + str(stonk1) + "_" + str(stonk2)
-    
-            spread = self.df[spread_col]
-    
-            rolling_mean = spread.rolling(window=z_window).mean()
-            rolling_std = spread.rolling(window=z_window).std()
-    
-            zscore = (spread - rolling_mean) / rolling_std
-            self.df[z_col] = zscore
-    
-            signal_values = np.where(
-                zscore > entry_threshold, -1,
-                np.where(zscore < -entry_threshold, 1,
-                         np.where(zscore.abs() < exit_threshold, 0, np.nan))
+        N = price_t.shape[0]
+        floated_weights = np.zeros(N)
+        cash_tm1 = weights_tm1[-1]  # extract last element = previous cash
+
+        for i in range(N):
+            if positions_t[i] == 1 and weights_tm1[i] > 0:
+                ratio = price_t[i] / price_tm1[i]
+                floated_weights[i] = weights_tm1[i] * ratio
+
+        floated_weights = floated_weights + new_allocations
+        floated_weights = np.append(floated_weights, cash_tm1)
+        sum_floated_weights = np.sum(floated_weights)
+        portfolio_weights = floated_weights / sum_floated_weights
+
+        return portfolio_weights, sum_floated_weights
+
+    @staticmethod
+    @njit
+    def backtest_weights_loop(prices: np.ndarray, zscores: np.ndarray, positions: np.ndarray,
+                               entry_threshold: float, max_active_pairs: int, method: str = "equal") -> tuple[np.ndarray, np.ndarray]:
+        """
+
+        Parameters
+        ----------
+        prices : np.ndarray
+            T x N price matrix
+        zscores : np.ndarray
+            T x N zscore signals matrix
+        positions : np.ndarray
+            T x N array of  positions
+        entry_threshold : float
+            threshold zscore for new positions
+        max_active_pairs : int
+            max number of trades allowed
+        method : str
+            weighting method. 
+            ('equal' or 'yolo')
+
+        Returns
+        -------
+        weights : np.ndarray
+            T x (N+1) portfolio weights. RMB LAST COL IS CASH
+        portfolio_values : np.ndarray
+            portf value at each timestep
+        """
+        T, N = prices.shape
+        weights = np.zeros((T, N + 1))  # include cash column
+        portfolio_values = np.zeros(T)
+
+        weights[0, -1] = 1.0
+        portfolio_values[0] = 1.0
+
+        for t in range(1, T):
+            z_t = zscores[t]
+            pos_tm1 = positions[t - 1]
+            pos_t = positions[t]
+            w_tm1 = weights[t - 1]
+            p_tm1 = prices[t - 1]
+            p_t = prices[t]
+
+            new_alloc = PairsBacktester.check_new_entries(z_t, pos_tm1, entry_threshold,
+                                                          max_active_pairs, method, w_tm1[-1])
+
+            weights[t], portfolio_values[t] = PairsBacktester.compute_portfolio_weights(
+                price_t=p_t,
+                price_tm1=p_tm1,
+                weights_tm1=w_tm1,
+                positions_t=pos_t,
+                new_allocations=new_alloc
             )
-    
-            signal = pd.Series(signal_values, index=self.df.index).ffill().fillna(0)
-            self.df[signal_col] = signal
 
+        return weights, portfolio_values
 
-    
-    def simulate_trades(self, 
-                        trading_cost = 0.005, 
-                        borrow_rate = 0.0001, 
-                        stop_loss_threshold = -0.10):
- 
-        cash = self.capital
-        have_position = False
-        trade_log = []
-        open_trade = {}
-        position_col = []
-        daily_pnl_col = []
-        cash_col = []
-    
-        # Compute returns input as cols
-        unique_tickers = list({s for pair in self.pairs for s in pair})
-        returns = self.df[unique_tickers].pct_change()
-    
-        for ticker in unique_tickers:
-            self.df[f"ret_{ticker}"] = returns[ticker]
-    
-        # start backtesting
-        for idx in range(1, len(self.df)):
-            if have_position:
-                
-                # need to find yolo pair and get their retns
-                row = self.df.iloc[idx]
-                prev_row = self.df.iloc[idx - 1]
-    
-                open_trade = open_trade
-                stonk1 = open_trade["stonk1"]
-                stonk2 = open_trade["stonk2"]
-                direction = open_trade["direction"]
-                
-                r1 = row[f"ret_{stonk1}"]
-                r2 = row[f"ret_{stonk2}"]
-                
-                # need to flip returns depending on long/short directions
-                # edmund might wanna acct for borrowing cost
-                if direction == 1:
-                    short_price = prev_row[stonk2]
-                    long_leg_return = r1
-                    short_leg_return = r2
-                    
-                else:
-                    short_price = prev_row[stonk1]
-                    long_leg_return = r2
-                    short_leg_return = r1
-    
-                short_cost = borrow_rate * short_price 
-                notional = cash
-                pnl = (long_leg_return - short_leg_return - short_cost) * notional * (1 - trading_cost)
-                cash += pnl
-                
-                #cache this shit
-                open_trade["log"].append({
-                    "time": self.df.index[idx],
-                    "pnl": pnl,
-                    "cash": cash
-                })
-    
-                position_col.append(1)
-                daily_pnl_col.append(pnl)
-                cash_col.append(cash)
-    
-                # check stop losses 
-                total_trade_pnl = 0.0
-                
-                for log_entry in open_trade["log"]:
-                    total_trade_pnl += log_entry["pnl"]
-    
-                if total_trade_pnl < stop_loss_threshold * cash:
-                    have_position = False
-                    open_trade["exit_time"] = self.df.index[idx]
-                    open_trade["reason"] = "stop_loss"
-                    trade_log.append(open_trade)
-                    open_trade = {}
-                
-                # check if signal no more
-                elif row[open_trade["signal_col"]] == 0:
-                    have_position = False
-                    open_trade["exit_time"] = self.df.index[idx]
-                    open_trade["reason"] = "mean_reversion"
-                    trade_log.append(open_trade)
-                    open_trade = {}
-    
-            # if not current position
+    @staticmethod
+    def export_results_to_csv(time_index: np.ndarray, output_path: str = "backtest_output.csv", **data_arrays):
+        """
+        
+        Parameters
+        ----------
+        time_index : np.ndarray
+            array of index timestamps
+        output_path : str
+            filepath to save the CSV
+        **data_arrays : dict
+            Keyword arguments of named arrays (e.g., zscore=arr, weights=arr).
+
+        Returns
+        -------
+        None
+            Writes CSV to disk.
+        """
+        df = pd.DataFrame(index=time_index)
+
+        for name, arr in data_arrays.items():
+            if arr.ndim == 1:
+                df[name] = arr
+            elif arr.ndim == 2:
+                for i in range(arr.shape[1]):
+                    df[f"{name}_{i}"] = arr[:, i]
             else:
-    
-                prev_row = self.df.iloc[idx - 1]
-                position_col.append(0)
-                daily_pnl_col.append(0.0)
-                cash_col.append(cash)
-    
-                # fk what if more than 1 signal?
-                candidate_entries = []
-    
-                # compare zscores
-                for pair in self.pairs:
-                    stonk1 = pair[0]
-                    stonk2 = pair[1]
-                    signal_col = f"signal_{stonk1}_{stonk2}"
-                    zscore_col = f"zscore_{stonk1}_{stonk2}"  
-    
-                    signal = prev_row[signal_col]
-                    
-                    #combined the zscores
-                    if signal != 0:
-                        
-                        zscore = prev_row[zscore_col]
-                        candidate_entries.append({
-                                                "pair": (stonk1, stonk2),
-                                                "signal": signal,
-                                                "zscore": abs(zscore),
-                                                "zscore_raw": zscore,
-                                                "signal_col": signal_col,
-                                                "beta_col": f"beta_{stonk1}_{stonk2}"
-                                                })
-    
-                # choose best pair all other pairs suck
-                if candidate_entries:
-                    candidate_entries.sort(key=lambda x: x["zscore"], reverse=True)
-                    top_pick = candidate_entries[0]
-    
-                    open_trade = {
-                        "entry_time": self.df.index[idx],
-                        "stonk1": top_pick["pair"][0],
-                        "stonk2": top_pick["pair"][1],
-                        "beta_col": top_pick["beta_col"],
-                        "signal_col": top_pick["signal_col"],
-                        "direction": top_pick["signal"],
-                        "log": []
-                    }
-    
-                    have_position = True
-    
-        # Finalize tracking columns
-        idx_range = self.df.index[:len(position_col) + 1]
-        self.df["position"] = pd.Series([0] + position_col, index=idx_range).ffill().astype(int)
-        self.df["strategy_pnl"] = pd.Series([0.0] + daily_pnl_col, index=idx_range)
-        self.df["strategy_cash"] = pd.Series([cash] + cash_col, index=idx_range)
-        self.trade_log = trade_log
+                raise ValueError(f"Unsupported array dimension for '{name}': {arr.ndim}")
 
-
-
-    def get_output(self):
-        return self.df
-
-backtester = PairsTrader(df, pairs)
-backtester.calc_beta_and_spread()
-backtester.calc_zscore_signals()
-backtester.simulate_trades()
-df_results = backtester.df
-trades = backtester.trade_log
+        df.to_csv(output_path)
+        print(f"Results exported to {output_path}")
