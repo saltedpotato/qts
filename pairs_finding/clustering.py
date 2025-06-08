@@ -64,24 +64,23 @@ class Clustering:
 
     def compute_stats(self) -> pl.DataFrame:
         """
-        Computes the mean and volatility (standard deviation) of percentage changes for each column.
+        Computes the median and volatility (standard deviation) of percentage changes for each column.
 
         Returns
         -------
         pl.DataFrame
-            A DataFrame with ticker symbols and their corresponding mean returns and volatility.
+            A DataFrame with ticker symbols and their corresponding median returns and volatility.
         """
+        df = self.df.select([i for i in self.df.columns if i not in ["date", "time"]])
+        returns = df.with_columns(pl.all().log().diff())
+
         return (
-            self.df.select([i for i in self.df.columns if i not in ["date", "time"]])
-            .with_columns(pl.all().log().diff())
-            .mean()
+            df.with_columns(pl.all().log().diff())
+            .median()
             .transpose(include_header=True, header_name="ticker", column_names=["ret"])
             .join(
-                self.df.select(
-                    [i for i in self.df.columns if i not in ["date", "time"]]
-                )
-                .with_columns(pl.all().log().diff().std())
-                .mean()
+                returns.with_columns(pl.all().std())
+                .median()
                 .transpose(
                     include_header=True, header_name="ticker", column_names=["vol"]
                 ),
@@ -89,6 +88,28 @@ class Clustering:
                 left_on="ticker",
                 right_on="ticker",
             )
+            .join(
+                returns.with_columns(pl.all().skew())
+                .median()
+                .transpose(
+                    include_header=True, header_name="ticker", column_names=["skew"]
+                ),
+                how="inner",
+                left_on="ticker",
+                right_on="ticker",
+            )
+            .join(
+                returns.with_columns(pl.all().kurtosis())
+                .median()
+                .transpose(
+                    include_header=True, header_name="ticker", column_names=["kurt"]
+                ),
+                how="inner",
+                left_on="ticker",
+                right_on="ticker",
+            )
+            .fill_nan(0)
+            .fill_null(0)
         )
 
     def scaling(self) -> np.ndarray:

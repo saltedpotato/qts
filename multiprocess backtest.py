@@ -2,6 +2,7 @@ import polars as pl
 import numpy as np
 from datetime import datetime, timedelta
 import json
+import os
 import concurrent.futures
 
 from data.cons_data import get_cons
@@ -23,14 +24,26 @@ warnings.filterwarnings("ignore")
 
 
 def run(periods):
-    train_start, train_end, trade_end = periods[0], periods[1], periods[2]
-    data = periods[3]
-    cons_date = periods[4]
-    out_path = periods[5]
+    warm_start, train_start, train_end, trade_end = (
+        periods[0],
+        periods[1],
+        periods[2],
+        periods[3],
+    )
+    data = periods[4]
+    cons_date = periods[5]
+    out_path = periods[6]
+
+    # next trading day
+    last_date = datetime.strptime(train_end, "%Y-%m-%d")
+    next_day = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
     print(train_start, train_end)
+    if os.path.isfile((f"{out_path}/result/result_{next_day}_{trade_end}.csv")):
+        return
+
     # TRAINING PERIOD FINDING OPTIMAL PARAMS #
-    data.read(cons=cons_date[train_end], start=train_start, end=train_end)
+    data.read(cons=cons_date[train_end], start=warm_start, end=train_end)
 
     train = data.filter(resample_freq="15m", hours=market_hours.MARKET)
 
@@ -42,10 +55,22 @@ def run(periods):
 
     find_pairs = cointegration_pairs(
         df=train.select(pl.all().exclude(["date", "time"])),
-        p_val_cutoff=0.01,
+        p_val_cutoff=0.005,
         cluster_pairs=c.cluster_pairs,
     )
     find_pairs.identify_pairs()
+
+    potential_trade_pairs = [
+        pair[0]
+        for sublist in find_pairs.cluster_sorted_pairs.values()
+        for pair in sublist
+    ]
+
+    data.read(
+        cons=set([item for pair in potential_trade_pairs for item in pair]),
+        start=warm_start,
+        end=train_end,
+    )
 
     opt = optimizer(
         data=data,
@@ -56,16 +81,22 @@ def run(periods):
 
     del c, find_pairs
 
-    study = opt.optimize(n_trials=150)
+    study = opt.optimize(
+        study_name="PAIRS_TRADING",
+        output_file_name=f"{out_path}/db/result_{next_day}_{trade_end}.db",
+        n_trials=150,
+    )
     p = study.best_params
 
-    study.trials_dataframe().to_csv(f"{out_path}/trials_{train_start}_{train_end}.csv")
+    study.trials_dataframe().to_csv(
+        f"{out_path}/trials/trials_{train_start}_{train_end}.csv"
+    )
 
     del opt, study
 
     optimal_params = {}
     for key, value in p.items():
-        if key != "pairs_to_trade":
+        if key not in ["pairs_to_trade", "buffer_capital"]:
             parts = key.split("_")
 
             pair = (parts[0], parts[1])
@@ -77,10 +108,6 @@ def run(periods):
             optimal_params[pair][param_name] = value
 
     # TRADING PERIOD USING PARAMS
-    # next trading day
-    last_date = datetime.strptime(train_end, "%Y-%m-%d")
-    next_day = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
-
     # reading pairs only from next trading day to next q end
     pairs_to_trade = list(optimal_params.keys())
     data.read(
@@ -105,15 +132,16 @@ def run(periods):
         stop_loss=np.array(
             [optimal_params[(p1, p2)][PARAMS.stop_loss] for p1, p2 in pairs_to_trade]
         ),
+        buffer_capital=p[PARAMS.buffer_capital],
     )
 
     returns.with_columns(
         pl.col("CAPITAL").pct_change().fill_null(0).alias("PORT_RET")
-    ).write_csv(f"{out_path}/result_{next_day}_{trade_end}.csv")
+    ).write_csv(f"{out_path}/result/result_{next_day}_{trade_end}.csv")
 
     convert_json = {f"{p1}_{p2}": params for (p1, p2), params in optimal_params.items()}
     with open(
-        f"{out_path}/optimal_params_{next_day}_{trade_end}.json", "w"
+        f"{out_path}/params/optimal_params_{next_day}_{trade_end}.json", "w"
     ) as json_file:
         json.dump(convert_json, json_file, default=str)
 
@@ -136,25 +164,27 @@ if __name__ == "__main__":
         >= datetime.strptime("2020-06-30", "%Y-%m-%d").date()
     ]
 
+    periods = 15
+
     period_ends = (
         pl.DataFrame(earliest_date_year, schema=["Date"])
-        .with_columns(pl.all().cast(pl.Date))
         .with_columns(
-            pl.all().dt.month().alias("Month"),
-            pl.all().dt.year().alias("Year"),
+            pl.all().cast(pl.Date),
         )
-        .group_by(["Month", "Year"], maintain_order=True)
-        .last()["Date"]
+        .with_columns((pl.col("Date").rank() // periods).alias("Chunk"))
+        .group_by("Chunk", maintain_order=True)
+        .agg(pl.col("Date").last())["Date"]
         .dt.strftime("%Y-%m-%d")
         .to_list()
     )
 
     periods = []
-    for i in range(6, len(period_ends), 3):  # range(2, len(period_ends))
+    for i in range(10, len(period_ends)):  # range(2, len(period_ends))
         periods.append(
             (
-                period_ends[i - 6],
-                period_ends[i - 3],
+                period_ends[i - 10],
+                period_ends[i - 2],
+                period_ends[i - 1],
                 period_ends[i],
                 data,
                 cons_date,
@@ -162,7 +192,7 @@ if __name__ == "__main__":
             )
         )
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(run, p) for p in periods]
         for future in concurrent.futures.as_completed(futures):
             try:

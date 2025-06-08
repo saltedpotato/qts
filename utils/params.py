@@ -7,3 +7,4 @@ class PARAMS:
     z_exit = "z_exit"
     stop_loss = "stop_loss"
     trade_freq = "trade_freq"
+    buffer_capital = "buffer_capital"

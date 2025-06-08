@@ -67,24 +67,24 @@ class optimizer:
         params = {
             (p1, p2): {
                 PARAMS.beta_win: trial.suggest_int(
-                    f"{p1}_{p2}_beta_win", 10, 500, step=5
+                    f"{p1}_{p2}_beta_win", 10, 1_000, step=10
                 ),
-                PARAMS.hurst_win: trial.suggest_int(
-                    f"{p1}_{p2}_hurst_win", 10, 500, step=5
-                ),
-                PARAMS.z_win: trial.suggest_int(f"{p1}_{p2}_z_win", 10, 500, step=5),
+                PARAMS.z_win: trial.suggest_int(f"{p1}_{p2}_z_win", 10, 1_000, step=10),
                 PARAMS.z_entry: trial.suggest_float(
-                    f"{p1}_{p2}_z_entry", 1.0, 4.0, step=0.2
+                    f"{p1}_{p2}_z_entry", 1.0, 3.0, step=0.1
                 ),
                 PARAMS.z_exit: trial.suggest_float(
-                    f"{p1}_{p2}_z_exit", -4.0, 1.0, step=0.2
+                    f"{p1}_{p2}_z_exit",
+                    1.0,
+                    3.0,
+                    step=0.1,  # note the - is applied in backtesting
                 ),
                 PARAMS.trade_freq: trial.suggest_categorical(
                     f"{p1}_{p2}_trade_freq",
-                    [str(i) + "m" for i in range(1, 120)],
+                    [str(i) + "m" for i in range(1, 16)],
                 ),
                 PARAMS.stop_loss: trial.suggest_float(
-                    f"{p1}_{p2}_stop_loss", 0, 0.05, step=0.002
+                    f"{p1}_{p2}_stop_loss", 0.002, 0.02, step=0.002
                 ),
             }
             for p1, p2 in pairs
@@ -98,6 +98,7 @@ class optimizer:
             stop_loss=np.array(
                 [params[(p1, p2)][PARAMS.stop_loss] for p1, p2 in pairs]
             ),
+            buffer_capital=trial.suggest_float(PARAMS.buffer_capital, 0.05, 0.5, step=0.05),
         )
         returns = (
             bt_df.select("CAPITAL")
@@ -112,7 +113,7 @@ class optimizer:
             pl.all().sign().abs()
         ).sum_horizontal().sign().sum() / len(count_trades)
 
-        if np.nanstd(returns) == 0 or pct_time_invested < 0.5:
+        if np.nanstd(returns) == 0:
             return -1e2
 
         # downside_vol = np.nanstd(returns[returns<0])
@@ -121,9 +122,11 @@ class optimizer:
             np.nanmean(returns) / np.nanstd(returns) * np.sqrt(390 * 252)
         )  # min level
 
-        return sharpe
+        return sharpe * (pct_time_invested * 0.5)
 
-    def optimize(self, n_trials: int = 200) -> optuna.study.study:
+    def optimize(
+        self, study_name, output_file_name, n_trials: int = 200
+    ) -> optuna.study.study:
         """
         Runs Optuna optimization over the defined search space.
 
@@ -138,7 +141,12 @@ class optimizer:
             study object
         """
         sampler = TPESampler(seed=621)
-        study = optuna.create_study(direction="maximize", sampler=sampler)
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=f"sqlite:///{output_file_name}",
+            direction="maximize",
+            sampler=sampler,
+        )
         study.optimize(
             self.objective,
             n_trials=n_trials,

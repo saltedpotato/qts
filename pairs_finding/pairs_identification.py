@@ -87,7 +87,7 @@ class cointegration_pairs:
         self.sort_pairs()
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def coint_test(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
         """
         Performs cointegration testing between two asset time series using the OLS method.

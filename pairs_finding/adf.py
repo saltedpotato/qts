@@ -192,6 +192,8 @@ class ADF_Test:
             A tuple containing the test statistic and the p-value.
         """
         """Get series and return the p-value and the t-stat of the coefficient"""
+        if np.isnan(series).any() or np.isinf(series).any():
+            return 1e6, 1e6
         if maxlag is None:
             n = int((len(series) - 1) ** (1.0 / 3))
         elif maxlag < 1:
