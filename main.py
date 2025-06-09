@@ -358,3 +358,23 @@ class PairsBacktester():
             returns_matrix[i] = daily_returns
 
         return positions_matrix, weights_matrix, returns_matrix
+
+
+max_positions = 4
+entry_zscore = 2.0
+take_profit_zscore = 0.5
+stop_loss_zscore = 3
+reentry_delay = 30
+window_size = 60
+price_array = pl.read_parquet()
+price_array = price_array['AAL', 'AAPL', 
+                          'ADBE', 'ADI', 
+                          'ADP', 'ADSK', 
+                          'ALGN', 'ALXN', 
+                          'AMAT', 'AMGN', 
+                          'AMZN', 'ATVI', 
+                          'BIIB', 'BKNG']
+price_array = price_array.to_numpy()
+
+spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, window_size = window_size)
+positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(spread_matrix, zscore_matrix, window_size, max_positions = 2, entry_zscore = 2.0, take_profit_zscore = 0.5, stop_loss_zscore = 3, reentry_delay = 60)
