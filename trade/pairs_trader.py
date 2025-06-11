@@ -1,7 +1,7 @@
 import polars as pl
 import numpy as np
 from numba import njit, prange, cuda
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Tuple
 
 from data.market_data import market_data
 from utils.params import PARAMS
@@ -173,6 +173,7 @@ class PairsTrader:
         n_pairs: int,
         z_entry_arr: np.ndarray,
         z_exit_arr: np.ndarray,
+        z_stop_arr: np.ndarray,
         market_close_flag: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -235,8 +236,8 @@ class PairsTrader:
 
             curr_signal = signal_arr[i]
 
-            exit_long_cond = curr_Z > z_exit_arr
-            exit_short_cond = curr_Z < -z_exit_arr
+            exit_long_cond = (curr_Z > z_exit_arr) | (curr_Z < -z_stop_arr)
+            exit_short_cond = (curr_Z < -z_exit_arr) | (curr_Z > z_stop_arr)
 
             pos_arr[i] = np.where(
                 (
@@ -409,18 +410,18 @@ class PairsTrader:
 
             for pair in prange(n_pairs):
                 # if capital wasnt 0, check for cumulative returns
-                if capital_allocation_arr[i - 1][pair] != 0:
+                check_loss_arr = capital_allocation_arr.T[pair]
+                if check_loss_arr[i - 1] != 0:
                     for lookback in range(i - 1, -1, -1):
                         # find when capital was last 0
                         if (
-                            capital_allocation_arr[lookback][pair] == 0
-                            and np.max(capital_allocation_arr[lookback + 1 : i][pair])
-                            != 0
+                            check_loss_arr[lookback] == 0
+                            and np.max(check_loss_arr[lookback + 1 : i]) != 0
                         ):
                             loss_arr[i][pair] = (
                                 # trailing stop loss
-                                capital_allocation_arr[i - 1][pair]
-                                / np.max(capital_allocation_arr[lookback + 1 : i][pair])
+                                check_loss_arr[i - 1]
+                                / np.max(check_loss_arr[lookback + 1 : i])
                             ) - 1
                             break
 
@@ -584,6 +585,12 @@ class PairsTrader:
             [self.params[pair][PARAMS.z_entry] for pair in self.pairs]
         )
         z_exit_arr = np.array([self.params[pair][PARAMS.z_exit] for pair in self.pairs])
+        z_stop_arr = z_exit_arr * (
+            1
+            + np.array(
+                [self.params[pair][PARAMS.z_stoz_stop_scaler] for pair in self.pairs]
+            )
+        )
 
         signal_arr, pos_arr, pos_beta_arr = self.compute_pos(
             Z_arr=Z_arr,
@@ -592,6 +599,7 @@ class PairsTrader:
             n_pairs=len(self.pairs),
             z_entry_arr=z_entry_arr,
             z_exit_arr=z_exit_arr,
+            z_stop_arr=z_stop_arr,
             market_close_flag=market_close_flag,
         )
 
@@ -621,7 +629,7 @@ class PairsTrader:
             pl.concat(
                 [
                     returns,
-                    # df.drop(["date", "time"]),
+                    df.drop(["date", "time"]),
                     signal_df,
                     pos_df,
                     pos_beta_df,
@@ -701,5 +709,20 @@ class PairsTrader:
                 + ["REMAINING_CAPITAL"]
             ).alias("CAPITAL")
         )
+
+        # ordered_columns = []
+
+        # for p1, p2 in self.pairs:
+        #     matching_columns = [
+        #         col for col in backtest_df.columns if f"{p1}_ON_{p2}" in col
+        #     ]
+        #     ordered_columns.extend(matching_columns)
+
+        # remaining_columns = [
+        #     col
+        #     for col in backtest_df.columns
+        #     if not any(sub in col for sub in f"{p1}_ON_{p2}")
+        # ]
+        # ordered_columns.extend(remaining_columns)
 
         return backtest_df

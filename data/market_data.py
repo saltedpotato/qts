@@ -40,16 +40,20 @@ class market_data:
 
         self.market_timing = {
             market_hours.DAYLIGHT: {
-                market_hours.PRE: datetime.time(8, 0, 0),
-                market_hours.MARKET_OPEN: datetime.time(13, 30, 0),
-                market_hours.MARKET_CLOSE: datetime.time(19, 59, 0),
-                market_hours.POST: datetime.time(23, 59, 0),
+                market_hours.PRE: datetime.time(7, 59, 0),  # 4:00 AM ET
+                market_hours.MARKET_OPEN: datetime.time(13, 29, 0),  # 9:30 AM ET
+                market_hours.MARKET_CLOSE: datetime.time(19, 59, 0),  # 4:00 PM ET
+                market_hours.POST: datetime.time(
+                    0, 0, 0
+                ),  # 8:00 PM ET (00:00 UTC next day)
             },
             market_hours.NORMAL: {
-                market_hours.PRE: datetime.time(9, 0, 0),
-                market_hours.MARKET_OPEN: datetime.time(14, 30, 0),
-                market_hours.MARKET_CLOSE: datetime.time(20, 59, 0),
-                market_hours.POST: datetime.time(23, 59, 0),
+                market_hours.PRE: datetime.time(8, 59, 0),  # 4:00 AM ET
+                market_hours.MARKET_OPEN: datetime.time(14, 29, 0),  # 9:30 AM ET
+                market_hours.MARKET_CLOSE: datetime.time(20, 59, 0),  # 4:00 PM ET
+                market_hours.POST: datetime.time(
+                    0, 59, 0
+                ),  # 8:00 PM ET (01:00 UTC next day)
             },
         }
 
@@ -76,6 +80,29 @@ class market_data:
 
         self.full_date_time = None
 
+        self.dst_dates = {
+            2014: {"start": "2014-03-09", "end": "2014-11-02"},
+            2015: {"start": "2015-03-08", "end": "2015-11-01"},
+            2016: {"start": "2016-03-13", "end": "2016-11-06"},
+            2017: {"start": "2017-03-12", "end": "2017-11-05"},
+            2018: {"start": "2018-03-11", "end": "2018-11-04"},
+            2019: {"start": "2019-03-10", "end": "2019-11-03"},
+            2020: {"start": "2020-03-08", "end": "2020-11-01"},
+            2021: {"start": "2021-03-14", "end": "2021-11-07"},
+            2022: {"start": "2022-03-13", "end": "2022-11-06"},
+            2023: {"start": "2023-03-12", "end": "2023-11-05"},
+            2024: {"start": "2024-03-10", "end": "2024-11-03"},
+            2025: {"start": "2025-03-09", "end": "2025-11-02"},
+            2026: {"start": "2026-03-08", "end": "2026-11-01"},
+            2027: {"start": "2027-03-14", "end": "2027-11-07"},
+            2028: {"start": "2028-03-12", "end": "2028-11-05"},
+            2029: {"start": "2029-03-11", "end": "2029-11-04"},
+            2030: {"start": "2030-03-10", "end": "2030-11-03"},
+            2031: {"start": "2031-03-09", "end": "2031-11-02"},
+            2032: {"start": "2032-03-14", "end": "2032-11-07"},
+            2033: {"start": "2033-03-13", "end": "2033-11-06"},
+        }
+
     def read(self, cons: List[str], start: str, end: str) -> bool:
         """
         Reads market data from parquet files, filters by date range, and prepares the final DataFrame.
@@ -97,19 +124,16 @@ class market_data:
         pl_start = pl.lit(start).str.strptime(pl.Date, "%Y-%m-%d")
         pl_end = pl.lit(end).str.strptime(pl.Date, "%Y-%m-%d")
 
+        self.df = self.pq_scanner.select(
+            [
+                "t",
+                "close",
+                "symbol",
+            ]
+        ).with_columns(date=pl.col("t").dt.date(), time=pl.col("t").dt.time())
+
         self.df = (
-            self.pq_scanner.select(
-                [
-                    "t",
-                    "close",
-                    "symbol",
-                ]
-            )
-            .with_columns(
-                date=pl.col("t").dt.date(),
-                time=pl.col("t").dt.time(),
-            )
-            .filter(
+            self.df.filter(
                 (
                     pl.col("date").is_between(
                         lower_bound=pl_start
@@ -124,8 +148,28 @@ class market_data:
             .collect(streaming=True)
             .pivot(on="symbol", index=["date", "time"], values="close")
             .sort(by=["date", "time"])
+            .with_columns(
+                year=pl.col("date").dt.year(),
+                is_dst=pl.lit(0).cast(pl.Int16),
+            )
             .lazy()
         )
+
+        for year, dates in self.dst_dates.items():
+            self.df = self.df.with_columns(
+                pl.when(
+                    (pl.col("year") == year)
+                    & (
+                        pl.col("date").is_between(
+                            pl.lit(dates["start"]).str.strptime(pl.Date, "%Y-%m-%d"),
+                            pl.lit(dates["end"]).str.strptime(pl.Date, "%Y-%m-%d"),
+                        )
+                    )
+                )
+                .then(1)
+                .otherwise(pl.col("is_dst"))
+                .alias("is_dst")
+            )
 
         self.prep_time()
 
@@ -135,16 +179,13 @@ class market_data:
             )
             .fill_null(strategy="forward")
             .filter(pl.col("date") >= pl_start)
+            .drop(["year"])
         ).collect()
 
         return True
 
     def filter(self, resample_freq, hours):
         df = self.filter_hours(hours=hours)
-        df = df.with_columns(
-            (pl.Series(name="max_time", values=np.array([0] * len(df)))),
-            (pl.Series(name="min_time", values=np.array([0] * len(df)))),
-        )
         df = self.resample_df(df=df, resample_freq=resample_freq)
 
         return df
@@ -172,7 +213,6 @@ class market_data:
         -------
         pl.DataFrame
             A DataFrame with the time column adjusted to the new frequency.
-            The `min_time` and `max_time` columns are dropped after resampling.
 
         Raises
         ------
@@ -203,7 +243,7 @@ class market_data:
                 .with_columns(pl.col("time").dt.time())
             )
 
-            return resampled_df.drop(["min_time", "max_time"])
+            return resampled_df
         return df
 
     def filter_hours(
@@ -241,8 +281,7 @@ class market_data:
                     pl.col("time")
                     >= pl.when(
                         # if normal then filter based on normal, if daylight then filter based on daylight
-                        pl.col("min_time")
-                        == self.market_timing[market_hours.NORMAL][market_hours.PRE]
+                        pl.col("is_dst") == 0
                     )
                     .then(
                         pl.lit(
@@ -261,10 +300,7 @@ class market_data:
                 )
                 & (
                     pl.col("time")
-                    <= pl.when(
-                        pl.col("min_time")
-                        == self.market_timing[market_hours.DAYLIGHT][market_hours.PRE]
-                    )
+                    <= pl.when(pl.col("is_dst") == 0)
                     .then(
                         pl.lit(
                             self.market_timing[market_hours.NORMAL][
@@ -286,10 +322,7 @@ class market_data:
             filtered_df = df.filter(
                 (
                     pl.col("time")
-                    <= pl.when(
-                        pl.col("min_time")
-                        == self.market_timing[market_hours.NORMAL][market_hours.PRE]
-                    )
+                    <= pl.when(pl.col("is_dst") == 0)
                     .then(
                         pl.lit(
                             self.market_timing[market_hours.NORMAL][
@@ -311,10 +344,7 @@ class market_data:
             filtered_df = df.filter(
                 (
                     pl.col("time")
-                    >= pl.when(
-                        pl.col("min_time")
-                        == self.market_timing[market_hours.NORMAL][market_hours.PRE]
-                    )
+                    >= pl.when(pl.col("is_dst") == 0)
                     .then(
                         pl.lit(
                             self.market_timing[market_hours.NORMAL][
@@ -334,7 +364,7 @@ class market_data:
         else:
             filtered_df = df
 
-        return filtered_df.drop(["min_time", "max_time"])
+        return filtered_df.drop("is_dst")
 
     def prep_time(self) -> None:
         """
@@ -343,26 +373,12 @@ class market_data:
 
         This method updates the `self.full_date_time` attribute with the full date-time information.
         """
-        self.date_time = {}
-        date_time = self.df.group_by("date").agg(
-            [
-                pl.col("time").min().alias("min_time"),
-                pl.col("time").max().alias("max_time"),
-            ]
-        )
-
-        daylight_days = date_time.filter(
-            pl.col("min_time")
-            < self.market_timing[market_hours.NORMAL][market_hours.PRE]
-        )
+        daylight_days = self.df.filter(pl.col("is_dst") == 1).select("date").unique()
         daylight_days = daylight_days.join(
             self.times[market_hours.DAYLIGHT], how="cross"
         )
 
-        normal_days = date_time.filter(
-            pl.col("min_time")
-            >= self.market_timing[market_hours.NORMAL][market_hours.PRE]
-        )
+        normal_days = self.df.filter(pl.col("is_dst") == 0).select("date").unique()
         normal_days = normal_days.join(self.times[market_hours.NORMAL], how="cross")
 
         self.full_date_time = pl.concat(

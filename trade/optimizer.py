@@ -3,7 +3,6 @@ from optuna.samplers import TPESampler
 import optuna.study.study
 import polars as pl
 import numpy as np
-from typing import Any, Dict
 
 from utils.params import PARAMS
 from utils.market_time import market_hours
@@ -54,7 +53,7 @@ class optimizer:
         float
             The Sharpe ratio resulting from the backtest using suggested parameters.
         """
-        trade_n_pairs = trial.suggest_int("pairs_to_trade", 1, 10, 1)
+        trade_n_pairs = trial.suggest_int("pairs_to_trade", 1, 10)
         pairs = self.find_pairs.get_top_pairs(n=trade_n_pairs)
 
         trader = PairsTrader(
@@ -67,38 +66,43 @@ class optimizer:
         params = {
             (p1, p2): {
                 PARAMS.beta_win: trial.suggest_int(
-                    f"{p1}_{p2}_beta_win", 10, 1_000, step=10
+                    f"{p1}_{p2}_{PARAMS.beta_win}", 8, 2**10
                 ),
-                PARAMS.z_win: trial.suggest_int(f"{p1}_{p2}_z_win", 10, 1_000, step=10),
+                PARAMS.z_win: trial.suggest_int(f"{p1}_{p2}_{PARAMS.z_win}", 8, 2**10),
                 PARAMS.z_entry: trial.suggest_float(
-                    f"{p1}_{p2}_z_entry", 1.0, 3.0, step=0.1
+                    f"{p1}_{p2}_{PARAMS.z_entry}", 2.0, 4.0
                 ),
                 PARAMS.z_exit: trial.suggest_float(
-                    f"{p1}_{p2}_z_exit",
-                    1.0,
-                    3.0,
-                    step=0.1,  # note the - is applied in backtesting
+                    f"{p1}_{p2}_{PARAMS.z_exit}",
+                    -3.5,
+                    1.0,  # note the - is applied in backtesting
                 ),
                 PARAMS.trade_freq: trial.suggest_categorical(
-                    f"{p1}_{p2}_trade_freq",
-                    [str(i) + "m" for i in range(1, 16)],
+                    f"{p1}_{p2}_{PARAMS.trade_freq}",
+                    [str(i) + "m" for i in range(1, 16, 1)],
                 ),
                 PARAMS.stop_loss: trial.suggest_float(
-                    f"{p1}_{p2}_stop_loss", 0.002, 0.02, step=0.002
+                    f"{p1}_{p2}_{PARAMS.stop_loss}", 0.005, 0.05, step=0.005
                 ),
             }
             for p1, p2 in pairs
         }
+
+        for p1, p2 in pairs:
+            params[(p1, p2)][PARAMS.z_stoz_stop_scaler] = params[(p1, p2)][
+                PARAMS.z_entry
+            ] * (
+                1
+                + trial.suggest_float(f"{p1}_{p2}_{PARAMS.z_stoz_stop_scaler}", 0.5, 1)
+            )
 
         trader.params = params
         bt_df = trader.backtest(
             start=self.start,
             end=self.end,
             cost=0.0005,
-            stop_loss=np.array(
-                [params[(p1, p2)][PARAMS.stop_loss] for p1, p2 in pairs]
-            ),
-            buffer_capital=trial.suggest_float(PARAMS.buffer_capital, 0.05, 0.5, step=0.05),
+            stop_loss=None,
+            buffer_capital=trial.suggest_float(PARAMS.buffer_capital, 0.0, 0.5),
         )
         returns = (
             bt_df.select("CAPITAL")
@@ -122,7 +126,7 @@ class optimizer:
             np.nanmean(returns) / np.nanstd(returns) * np.sqrt(390 * 252)
         )  # min level
 
-        return sharpe * (pct_time_invested * 0.5)
+        return sharpe * pct_time_invested
 
     def optimize(
         self, study_name, output_file_name, n_trials: int = 200

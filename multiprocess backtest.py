@@ -45,17 +45,17 @@ def run(periods):
     # TRAINING PERIOD FINDING OPTIMAL PARAMS #
     data.read(cons=cons_date[train_end], start=warm_start, end=train_end)
 
-    train = data.filter(resample_freq="15m", hours=market_hours.MARKET)
+    train = data.filter(resample_freq="30m", hours=market_hours.MARKET)
 
     c = Clustering(df=train.select(pl.all().exclude(["date", "time"])))
 
-    # c.run_clustering(method=Clustering_methods.kmeans, min_clusters=2, max_clusters=6)
+    # c.run_clustering(method=Clustering_methods.kmeans, min_clusters=2, max_clusters=10)
 
     c.run_clustering(method=Clustering_methods.agnes, min_clusters=2, max_clusters=5)
 
     find_pairs = cointegration_pairs(
         df=train.select(pl.all().exclude(["date", "time"])),
-        p_val_cutoff=0.005,
+        p_val_cutoff=0.01,
         cluster_pairs=c.cluster_pairs,
     )
     find_pairs.identify_pairs()
@@ -153,9 +153,7 @@ if __name__ == "__main__":
     cons = get_cons(etf=etf)
     cons_date = cons.read()
 
-    data = market_data(
-        file_path="C:/Users/edmun/OneDrive/Desktop/Quantitative Trading Strategies/Project/qts/data/polygon/*.parquet"
-    )
+    data = market_data(file_path="data/polygon/*.parquet")
     out_path = "output/polygon"
     earliest_date_year = [
         i
@@ -164,7 +162,7 @@ if __name__ == "__main__":
         >= datetime.strptime("2020-06-30", "%Y-%m-%d").date()
     ]
 
-    periods = 15
+    periods = 20
 
     period_ends = (
         pl.DataFrame(earliest_date_year, schema=["Date"])
@@ -192,7 +190,7 @@ if __name__ == "__main__":
             )
         )
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(run, p) for p in periods]
         for future in concurrent.futures.as_completed(futures):
             try:
