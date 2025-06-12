@@ -51,6 +51,7 @@ class PairsBacktester():
         n_pairs     = price_array.shape[1] // 2
         shape       = (n_timesteps - window_size + 1, window_size)# get shape to pass to as_strided. can be used for all cus i expect all same size
         
+        beta_matrix   = np.full((n_timesteps, n_pairs), np.nan, dtype = np.float64)
         spread_matrix = np.full((n_timesteps, n_pairs), np.nan, dtype = np.float64)
         zscore_matrix = np.full((n_timesteps, n_pairs), np.nan, dtype = np.float64)
         
@@ -85,7 +86,11 @@ class PairsBacktester():
                 # insert computed beta into initialized array
                 if var > 0:
                     beta[window_size + i - 1] = (cov/var)
-        
+                else:
+                    beta[window_size + i - 1] = beta[window_size + i - 2] # forward fill beta
+            
+            beta_matrix[:, j] = beta
+            
         #######################################################################
         ################### STEP 3 : COMPUTE ROLLING SPREAD ###################
         #######################################################################
@@ -119,12 +124,14 @@ class PairsBacktester():
         
             zscore_matrix[:, j] = zscore
 
-        return spread_matrix, zscore_matrix ## [2 * window_size - 3:, :] #weiird slice but trust me its to warm-up the signals
+        return beta_matrix, spread_matrix, zscore_matrix ## [2 * window_size - 3:, :] #weiird slice but trust me its to warm-up the signals
     
 
     @staticmethod
     @njit
-    def simulate_portfolio(spread_matrix: np.ndarray,
+    def simulate_portfolio(price_array: np.ndarray,
+                           beta_matrix: np.ndarray,
+                           spread_matrix: np.ndarray,
                            zscore_matrix: np.ndarray,
                            window_size: int,
                            max_positions: int,
@@ -141,6 +148,13 @@ class PairsBacktester():
         
         Parameters
         ----------
+        price_array : np.ndarray
+            2D array of shape (n_timesteps, 2 * n_pairs), where each consecutive pair of
+            columns corresponds to (x, y) price data for a trading pair.
+            
+        beta_matrix : np.ndarray
+            2D array of shape (n_timesteps, n_pairs), where each column corresponds beta(x, y) for a trading pair.
+            
         spread_matrix : np.ndarray
             A 2D array of shape (T, N), where T is the number of time steps and N is the number of trading pairs.
             Each column contains the spread values for one pair over time.
@@ -184,28 +198,37 @@ class PairsBacktester():
         """
 
         #######################################################################
-        ################ STEP 1 : COMPUTE DAILY SPREAD RETURNS ################
+        #################### STEP 1 : COMPUTE DAILY RETURNS ###################
         #######################################################################
         
-        n_timesteps = spread_matrix.shape[0]
-        n_pairs = spread_matrix.shape[1]
-        spread_rtn_matrix = np.full((n_timesteps, n_pairs), np.nan, dtype = np.float64)
+        n_timesteps    = spread_matrix.shape[0]
+        n_pairs        = spread_matrix.shape[1]
+
+        x_price_matrix = np.empty((n_timesteps, n_pairs), dtype = np.float64)
+        y_price_matrix = np.empty((n_timesteps, n_pairs), dtype = np.float64)
         
-        # compute spread return by using (T spread / T-1 spread)
-        for i in range(window_size, n_timesteps): # window_size because need 2 days to get returns.
-            spread_rtn_matrix[i, :] = spread_matrix[i, :] / spread_matrix[i - 1, :]
+        for col in range(n_pairs):
+            x_price_matrix[:, col] = price_array[:, 2 * col]
+            y_price_matrix[:, col] = price_array[:, 2 * col + 1]
+
+        #spread_rtn_matrix = np.full((n_timesteps, n_pairs), np.nan, dtype = np.float64)
         
-            
+        #compute spread return by using (T spread / T-1 spread)
+        #for i in range(window_size, n_timesteps): # window_size because need 2 days to get returns.
+        #    spread_rtn_matrix[i, :] = spread_matrix[i, :] / spread_matrix[i - 1, :]
+        
         #######################################################################
         ################### STEP 2 : FIGURE OUT PORTF VAL #####################
         #######################################################################
 
-        allocation = 1/max_positions
+        allocation            = 1 / max_positions
 
         # initialize for positions, wgts, rtns tracking
         delay_tracker         = np.full(n_pairs, 0, dtype = int) # to prevent too early re-enter same position
-        returns_matrix        = np.full(n_timesteps, np.nan, dtype = np.float64)
-        positions_matrix      = np.full((n_timesteps, n_pairs), 0, dtype = int)
+        beta_tracker          = np.full(n_pairs, 0.0, dtype = np.float64) # track entry beta
+        
+        returns_matrix        = np.full(n_timesteps, np.nan, dtype = np.float64) # storage matrix of returns
+        positions_matrix      = np.full((n_timesteps, n_pairs), 0, dtype = int) # storage matrix of positions
         weights_matrix        = np.full((n_timesteps, n_pairs + 1), 0.0, dtype = np.float64) # +1 col for cash
         weights_matrix[:, -1] = 1 # for cash => 100% in cash
         
@@ -222,8 +245,15 @@ class PairsBacktester():
             t_weights       = tm1_weights.copy() # get t weights. just copy first
             t_positions     = tm1_positions.copy() # initialize array for T positions. use t-1 as template
             
+            tm1_beta        = beta_matrix[i - 1, :]
             tm1_zscore      = zscore_matrix[i - 1, :]
 
+            tm1_x_price     = x_price_matrix[i - 1, :]
+            tm1_y_price     = y_price_matrix[i - 1, :]
+            
+            t_x_price       = x_price_matrix[i, :]
+            t_y_price       = y_price_matrix[i, :]
+            
             # CHECK TP/SL TO GET CLEARER PICTURE
             for j in range(n_pairs): # for each pair,
                 
@@ -232,13 +262,16 @@ class PairsBacktester():
                     if tm1_zscore[j] >= -take_profit_zscore: # if COULD HAVE take profit
                         t_positions[j] = 0 # take profit!
                         t_weights[-1] += tm1_weights[j] # assume sell at prev close, add back to cash
+                        
                         t_weights[j] = 0.0 # clear out position
+                        beta_tracker[j] = 0.0 # clear beta cache
                         
                     elif tm1_zscore[j] <= -stop_loss_zscore: # if reach stop loss!
                         t_positions[j] = 0 # stop loss
                         t_weights[-1] += tm1_weights[j] # assume sell at prev close, add back to cash
-                        t_weights[j] = 0.0 # clear out position
                         
+                        t_weights[j] = 0.0 # clear out position
+                        beta_tracker[j] = 0.0 # clear beta cache
                         delay_tracker[j] = reentry_delay # CANNOT BUY INSTANTLY NEXT PERIOD
 
                 elif tm1_positions[j] == -1: # if short position, check tp/sl
@@ -246,14 +279,17 @@ class PairsBacktester():
                     if tm1_zscore[j] <= take_profit_zscore: # if could have taken profit
                         t_positions[j] = 0 # take profit!
                         t_weights[-1] += tm1_weights[j] # assume sell at prev close, add back to cash
+                        
                         t_weights[j] = 0.0 # clear out position
+                        beta_tracker[j] = 0.0 # clear beta cache
                         
                     elif tm1_zscore[j] >= stop_loss_zscore: # if reach stop loss ALREADY DIE LAST PERIOD
 
                         t_positions[j] = 0 # stop loss
                         t_weights[-1] += tm1_weights[j] # assume sell at prev close, add back to cash
-                        t_weights[j] = 0.0 # clear out position
                         
+                        t_weights[j] = 0.0 # clear out position
+                        beta_tracker[j] = 0.0 # clear beta cache
                         delay_tracker[j] = reentry_delay # CANNOT BUY INSTANTLY NEXT PERIOD
             
             # get number of currently open positions, after checking SL/TP but BEFORE new entry in current timestep
@@ -266,8 +302,7 @@ class PairsBacktester():
             for k in range(n_pairs):# ignore all pairs that recently exited
                 if tm1_positions[k] ==0 and np.abs(tm1_zscore[k]) >= entry_zscore and delay_tracker[k] == 0:
                     temp_array[k] = 1
-            
-            
+
             n_new_positions = np.sum(temp_array)
             
             #########################################################################
@@ -304,12 +339,13 @@ class PairsBacktester():
                         t_positions[a] = -1 # short the spread
                         t_weights[a] = allocation if allocation <= t_weights[-1] else t_weights[-1]
                         t_weights[-1] -= t_weights[a] # remove weight from cash
-                
+                        beta_tracker[a] = tm1_beta[a] # track entry beta
+                        
                     elif tm1_positions[a] == 0 and tm1_zscore[a] <= -entry_zscore: # if no active posn + long signal cus spread too narrow
                         t_positions[a] = 1 # long the spread
                         t_weights[a] = allocation if allocation <= t_weights[-1] else t_weights[-1]
                         t_weights[-1] -= t_weights[a] # remove weight from cash
-
+                        beta_tracker[a] = tm1_beta[a] # track entry beta
 
 
             # YOLO TRADE LETS GO
@@ -323,29 +359,36 @@ class PairsBacktester():
                         t_positions[b] = -1 # short the spread
                         t_weights[b] = allocation if allocation <= t_weights[-1] else t_weights[-1]# ENTER
                         t_weights[-1] -= t_weights[b]# DEDUCT CASH
-
+                        beta_tracker[b] = tm1_beta[b] # track entry beta
                         
                     elif tm1_positions[b] == 0 and tm1_zscore[b] <= -entry_zscore and delay_tracker[b] == 0: # if no active posn + long signal + not recent slcus spread too narrow
 
                         t_positions[b] = 1 # long the spread
                         t_weights[b] = allocation if allocation <= t_weights[-1] else t_weights[-1] # ENTER
                         t_weights[-1] -= t_weights[b] # DEDUCT CASH
-
+                        beta_tracker[b] = tm1_beta[b] # track entry beta
 
             #########################################################################
             #################### STEP 2.3 : COMPUTE WGTS & RTNS #####################
             #########################################################################
+
+            tm1_spread_price = (tm1_y_price - (beta_tracker * tm1_x_price))
+            t_spread_price = (t_y_price - (beta_tracker * t_x_price))
+            net_spread_price = (tm1_y_price + np.abs(beta_tracker * tm1_x_price))
             
-            daily_returns =  np.sum((spread_rtn_matrix[i, :] - 1) * t_weights[:-1]) # compute t_weights before float!!
-            
-            t_weights[:-1] = (((1 - spread_rtn_matrix[i, :]) * t_positions) + 1) * t_weights[:-1] # float weights of pairs only! fuck cash
+            returns_array = t_positions * ((t_spread_price - tm1_spread_price)/net_spread_price)
+            daily_returns =  np.sum(returns_array * t_weights[:-1]) # compute t_weights before float!!
+
+            #np.sum((spread_rtn_matrix[i, :] - 1) * t_weights[:-1]) # compute t_weights before float!!
+
+            t_weights[:-1] = (returns_array + 1) * t_weights[:-1] # float weights of pairs only! fuck cash
 
             t_weights = np.round(t_weights, 6)
             total = np.sum(t_weights)
             t_weights /= total
-                
+
             #########################################################################
-            #################### STEP 2.x : APPEND TO MAIN MATRIX ###################
+            #################### STEP 2.4 : APPEND TO MAIN MATRIX ###################
             #########################################################################
             # decrease delay_tracker
             
@@ -358,7 +401,6 @@ class PairsBacktester():
             returns_matrix[i] = daily_returns
 
         return positions_matrix, weights_matrix, returns_matrix
-
 
 max_positions = 4
 entry_zscore = 2.0
@@ -376,5 +418,5 @@ price_array = price_array['AAL', 'AAPL',
                           'BIIB', 'BKNG']
 price_array = price_array.to_numpy()
 
-spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, window_size = window_size)
-positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(spread_matrix, zscore_matrix, window_size, max_positions = 2, entry_zscore = 2.0, take_profit_zscore = 0.5, stop_loss_zscore = 3, reentry_delay = 60)
+beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, window_size = window_size)
+positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(price_array, beta_matrix, spread_matrix, zscore_matrix, window_size, max_positions = 2, entry_zscore = 2.0, take_profit_zscore = 0.5, stop_loss_zscore = 3, reentry_delay = 60)
