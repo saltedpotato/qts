@@ -1,15 +1,26 @@
+
+from datetime import datetime
+import polars as pl
+
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
 from numba import njit
+from pairs_identification import cointegration_pairs
 
+# note! need to ensure to get (2xwindow_size - 2) more datapoints so it neatly dropna into start of quarter
+# drop 1 LESS for returns calculation
+
+
+# to do - after compute_rolling_zscore, trim x and y (should be [2 * window_size - 3:])
+# to do - need to drop first row after compute_positions?
+# !!!! REMOVE WINDOW_SIZE WILL NOT NEED AFTERWARDS IN COMPUTE_POSITIONS !!!!!!
 class PairsBacktester():
 
     @staticmethod
     @njit
     def compute_rolling_zscore(price_array: np.ndarray, 
                                window_size: int
-                               ) -> tuple[np.ndarray, np.ndarray]:
-        
+                               ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Computes the rolling beta, spread, and z-score for multiple asset pairs over time.
 
@@ -34,6 +45,10 @@ class PairsBacktester():
 
         Returns
         -------
+        beta_matrix : np.ndarray
+            2D array of shape (n_timesteps, n_pairs) containing the rolling hedge ratios (betas)
+            used to neutralize x vs y for each pair.
+        
         spread_matrix : np.ndarray
             2D array of shape (n_timesteps, n_pairs) containing the rolling spread series
             for each pair.
@@ -99,9 +114,10 @@ class PairsBacktester():
             
             #start from window_size - 1 since already np.nan intialized
             for i in range(window_size - 1, n_timesteps): 
-                spread[i] = y[i] - (beta[i] - x[i])
+                spread[i] = y[i] - (beta[i] * x[i])
                 
             spread_matrix[:, j] = spread
+            
         #######################################################################
         ################### STEP 4 : COMPUTE ROLLING Z-SCORE ##################
         #######################################################################
@@ -130,22 +146,26 @@ class PairsBacktester():
     @staticmethod
     @njit
     def simulate_portfolio(price_array: np.ndarray,
-                           beta_matrix: np.ndarray,
-                           spread_matrix: np.ndarray,
-                           zscore_matrix: np.ndarray,
-                           window_size: int,
-                           max_positions: int,
-                           entry_zscore: float,
-                           take_profit_zscore: float,
-                           stop_loss_zscore: float,
-                           reentry_delay: int
-                           ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                            beta_matrix: np.ndarray,
+                            spread_matrix: np.ndarray,
+                            zscore_matrix: np.ndarray,
+                            window_size: int,
+                            max_positions: int,
+                            entry_zscore: float,
+                            take_profit_zscore: float,
+                            stop_loss_zscore: float,
+                            reentry_delay: int,
+                            trading_cost: float,
+                            ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Simulates a rule-based long-short pairs trading strategy using z-score signals, stop-loss/take-profit rules, and capital allocation constraints.
+        Simulates a rule-based long-short pairs trading strategy using z-score signals,
+        stop-loss/take-profit rules, and capital allocation constraints.
         
-        This method iterates over time, dynamically assigning positions and rebalancing weights based on pair-specific z-scores and prior portfolio states.
-        Capital is allocated to a maximum number of pairs each day, and trade delays are enforced after stop-loss exits.
-        
+        This method iterates over time, dynamically assigning positions and rebalancing weights
+        based on pair-specific z-scores and prior portfolio states.
+        Capital is allocated to a maximum number of pairs each day, and trade delays are enforced
+        after stop-loss exits.
+
         Parameters
         ----------
         price_array : np.ndarray
@@ -153,47 +173,57 @@ class PairsBacktester():
             columns corresponds to (x, y) price data for a trading pair.
             
         beta_matrix : np.ndarray
-            2D array of shape (n_timesteps, n_pairs), where each column corresponds beta(x, y) for a trading pair.
+            2D array of shape (n_timesteps, n_pairs), where each value is the rolling hedge ratio
+            from regressing y on x in a pair (i.e., y ~ x).
             
         spread_matrix : np.ndarray
-            A 2D array of shape (T, N), where T is the number of time steps and N is the number of trading pairs.
-            Each column contains the spread values for one pair over time.
-        
+            2D array of shape (n_timesteps, n_pairs), with the residual (spread) between
+            y and beta * x for each pair.
+
         zscore_matrix : np.ndarray
-            A 2D array of shape (T, N), corresponding to the z-scores of the spread series for each pair at each time step.
-        
+            2D array of shape (n_timesteps, n_pairs), containing standardized z-scores
+            of the spread for each pair and time step.
+
         window_size : int
-            The number of periods used to warm up the strategy (e.g., to wait for z-score calculation stability).
-        
+            The number of periods used to warm up the strategy (e.g., to wait for z-score
+            calculation stability).
+
         max_positions : int
             Maximum number of simultaneous pair trades allowed in the portfolio at any given time.
-        
+
         entry_zscore : float
-            Z-score threshold used to trigger entry signals. Pairs are entered when the absolute z-score exceeds this threshold.
-        
+            Z-score threshold used to trigger entry signals. Pairs are entered when the absolute
+            z-score exceeds this threshold:
+            - zscore >= entry_zscore triggers a short spread (sell A, buy B)
+            - zscore <= -entry_zscore triggers a long spread (buy A, sell B)
+
         take_profit_zscore : float
-            Z-score level at which positions are exited for profit. For long spreads, this is triggered when z-score ≥ -take_profit_zscore.
-            For short spreads, it is triggered when z-score ≤ take_profit_zscore.
-        
+            Z-score level at which positions are exited for profit:
+            - Long spread: zscore ≥ -take_profit_zscore
+            - Short spread: zscore ≤ take_profit_zscore
+
         stop_loss_zscore : float
-            Z-score level at which positions are forcefully exited to stop losses. For long spreads, this is triggered when z-score ≤ -stop_loss_zscore.
-            For short spreads, it is triggered when z-score ≥ stop_loss_zscore.
-        
+            Z-score level at which positions are forcefully exited to stop losses:
+            - Long spread: zscore ≤ -stop_loss_zscore
+            - Short spread: zscore ≥ stop_loss_zscore
+
         reentry_delay : int
-            Number of periods to wait before re-entering a trade after a stop-loss has been triggered for that pair.
-        
+            Number of periods to wait before re-entering a trade after a stop-loss
+            has been triggered for that pair.
+
         Returns
         -------
         positions_matrix : np.ndarray
-            A 2D array of shape (T, N) with values in {1, 0, -1}. Each row represents portfolio positions:
+            2D array of shape (n_timesteps, n_pairs) with values in {1, 0, -1}. Each row represents portfolio positions:
             1 = long spread (buy A, sell B), -1 = short spread (sell A, buy B), 0 = no position.
-        
+
         weights_matrix : np.ndarray
-            A 2D array of shape (T, N + 1). Each row contains portfolio weights:
-            the first N elements are weights allocated to pairs, the last element is cash weight.
-        
+            2D array of shape (n_timesteps, n_pairs + 1). Each row contains portfolio weights:
+            the first n_pairs elements are weights allocated to active positions, and the final
+            column represents cash weight.
+
         returns_matrix : np.ndarray
-            A 1D array of shape (T,), representing daily portfolio return at each time step,
+            1D array of shape (n_timesteps,), representing the daily portfolio return at each time step,
             computed as the weighted return of all active positions.
         """
 
@@ -265,6 +295,9 @@ class PairsBacktester():
                         
                         t_weights[j] = 0.0 # clear out position
                         beta_tracker[j] = 0.0 # clear beta cache
+
+                        tm1_y_price[j] -= trading_cost # short Y at lower price
+                        tm1_x_price[j] += trading_cost # long X at higher price
                         
                     elif tm1_zscore[j] <= -stop_loss_zscore: # if reach stop loss!
                         t_positions[j] = 0 # stop loss
@@ -273,7 +306,10 @@ class PairsBacktester():
                         t_weights[j] = 0.0 # clear out position
                         beta_tracker[j] = 0.0 # clear beta cache
                         delay_tracker[j] = reentry_delay # CANNOT BUY INSTANTLY NEXT PERIOD
-
+                        
+                        tm1_y_price[j] -= trading_cost # short Y at lower price
+                        tm1_x_price[j] += trading_cost # long X at higher price
+                        
                 elif tm1_positions[j] == -1: # if short position, check tp/sl
 
                     if tm1_zscore[j] <= take_profit_zscore: # if could have taken profit
@@ -282,6 +318,9 @@ class PairsBacktester():
                         
                         t_weights[j] = 0.0 # clear out position
                         beta_tracker[j] = 0.0 # clear beta cache
+
+                        tm1_y_price[j] += trading_cost # buy Y at higher price
+                        tm1_x_price[j] -= trading_cost # short X at lower price
                         
                     elif tm1_zscore[j] >= stop_loss_zscore: # if reach stop loss ALREADY DIE LAST PERIOD
 
@@ -291,6 +330,10 @@ class PairsBacktester():
                         t_weights[j] = 0.0 # clear out position
                         beta_tracker[j] = 0.0 # clear beta cache
                         delay_tracker[j] = reentry_delay # CANNOT BUY INSTANTLY NEXT PERIOD
+                        
+                        tm1_y_price[j] += trading_cost # buy Y at higher price
+                        tm1_x_price[j] -= trading_cost # short X at lower price
+                        
             
             # get number of currently open positions, after checking SL/TP but BEFORE new entry in current timestep
             #n_open_positions = np.sum(np.abs(positions_matrix[i - 1, :]) > 0)
@@ -300,7 +343,7 @@ class PairsBacktester():
             temp_array = np.full(n_pairs, 0, dtype = int) # temp variable to count new positions
             
             for k in range(n_pairs):# ignore all pairs that recently exited
-                if tm1_positions[k] ==0 and np.abs(tm1_zscore[k]) >= entry_zscore and delay_tracker[k] == 0:
+                if tm1_positions[k] ==0 and np.abs(tm1_zscore[k]) >= entry_zscore and delay_tracker[k] == 0 and abs(tm1_beta[k]) < 2:
                     temp_array[k] = 1
 
             n_new_positions = np.sum(temp_array)
@@ -341,13 +384,18 @@ class PairsBacktester():
                         t_weights[-1] -= t_weights[a] # remove weight from cash
                         beta_tracker[a] = tm1_beta[a] # track entry beta
                         
+                        tm1_y_price[a] -= trading_cost # short Y at lower price
+                        tm1_x_price[a] += trading_cost # long X at higher price
+                        
                     elif tm1_positions[a] == 0 and tm1_zscore[a] <= -entry_zscore: # if no active posn + long signal cus spread too narrow
                         t_positions[a] = 1 # long the spread
                         t_weights[a] = allocation if allocation <= t_weights[-1] else t_weights[-1]
                         t_weights[-1] -= t_weights[a] # remove weight from cash
                         beta_tracker[a] = tm1_beta[a] # track entry beta
 
-
+                        tm1_y_price[a] += trading_cost # buy Y at higher price
+                        tm1_x_price[a] -= trading_cost # short X at lower price
+                        
             # YOLO TRADE LETS GO
             else: # means (n_new_positions + n_open_positions) <= max_positions. nothing breaking. within limits
 
@@ -361,6 +409,9 @@ class PairsBacktester():
                         t_weights[-1] -= t_weights[b]# DEDUCT CASH
                         beta_tracker[b] = tm1_beta[b] # track entry beta
                         
+                        tm1_y_price[b] -= trading_cost # short Y at lower price
+                        tm1_x_price[b] += trading_cost # long X at higher price
+                        
                     elif tm1_positions[b] == 0 and tm1_zscore[b] <= -entry_zscore and delay_tracker[b] == 0: # if no active posn + long signal + not recent slcus spread too narrow
 
                         t_positions[b] = 1 # long the spread
@@ -368,6 +419,9 @@ class PairsBacktester():
                         t_weights[-1] -= t_weights[b] # DEDUCT CASH
                         beta_tracker[b] = tm1_beta[b] # track entry beta
 
+                        tm1_y_price[b] += trading_cost # buy Y at higher price
+                        tm1_x_price[b] -= trading_cost # short X at lower price
+                        
             #########################################################################
             #################### STEP 2.3 : COMPUTE WGTS & RTNS #####################
             #########################################################################
@@ -402,21 +456,120 @@ class PairsBacktester():
 
         return positions_matrix, weights_matrix, returns_matrix
 
-max_positions = 4
+
+    
+quarters = [
+    (datetime(2020, 6, 1), datetime(2020, 9, 1)),
+    (datetime(2020, 9, 1), datetime(2020, 12, 1)),
+    (datetime(2020, 12, 1), datetime(2021, 3, 1)),
+    (datetime(2021, 3, 1), datetime(2021, 6, 1)),
+    (datetime(2021, 6, 1), datetime(2021, 9, 1)),
+    (datetime(2021, 9, 1), datetime(2021, 12, 1)),
+    (datetime(2021, 12, 1), datetime(2022, 3, 1)),
+    (datetime(2022, 3, 1), datetime(2022, 6, 1)),
+    (datetime(2022, 6, 1), datetime(2022, 9, 1)),
+    (datetime(2022, 9, 1), datetime(2022, 12, 1)),
+    (datetime(2022, 12, 1), datetime(2023, 3, 1)),
+    (datetime(2023, 3, 1), datetime(2023, 6, 1)),
+    (datetime(2023, 6, 1), datetime(2023, 9, 1)),
+    (datetime(2023, 9, 1), datetime(2023, 12, 1)),
+    (datetime(2023, 12, 1), datetime(2024, 3, 1)),
+    (datetime(2024, 3, 1), datetime(2024, 6, 1)),
+    (datetime(2024, 6, 1), datetime(2024, 9, 1)),
+    (datetime(2024, 9, 1), datetime(2024, 12, 1)),
+    (datetime(2024, 12, 1), datetime(2025, 3, 1)),
+    (datetime(2025, 3, 1), datetime(2025, 6, 1)),
+    ]
+
+first_20 = ['NLOK', 'CPRT', 'CTAS', 'NLOK', 'XEL', 'ROP', 'FB', 'AVGO', 'LULU', 'NLOK', 'TMUS', 'WDC', 'INCY', 'VRTX', 'JBHT', 'NXPI', 'JBHT', 'ON', 'EA', 'DXCM', 
+            'DIS', 'NLOK', 'NLOK', 'ON', 'KHC', 'ON', 'AAL', 'REGN', 'AVGO', 'NLOK', 'COST', 'ON', 'MNST', 'ENPH', 'VRSK', 'ON', 'XLNX', 'KDP', 'ADBE', 'ADSK']
+
+
+from utils.market_time import market_hours
+from utils.params import PARAMS
+from utils.clustering_methods import Clustering_methods
+
+from pairs_finding.pairs_identification import cointegration_pairs
+from pairs_finding.clustering import Clustering
+    
+for period in quarters:
+    print(period)
+    main_df = pl.read_parquet(r"full_qqq.parquet")
+    main_df = main_df.filter((pl.col("t") >= period[0]) & (pl.col("t") < period[1]))
+        
+    coint_model = cointegration_pairs(df=main_df, p_val_cutoff=0.05)
+    coint_model.identify_pairs()
+    pairs = coint_model.get_top_pairs()
+    print(pairs)
+    saved_pairs.append(pairs)
+    break
+
+#############
+
+c = Clustering(df=main_df.select(pl.all().exclude(["date", "time"])))
+c.run_clustering(method=Clustering_methods.agnes, min_clusters=2, max_clusters=5)
+    
+find_pairs = cointegration_pairs(
+    df = main_df.select(pl.all().exclude(["date", "time"])),
+    p_val_cutoff=0.01,
+    cluster_pairs=c.cluster_pairs,
+)
+
+pairs = find_pairs.get_top_pairs()
+
+
+############################ fake data 1
+import polars as pl
+import numpy as np
+import pandas as pd
+
+max_positions = 2
 entry_zscore = 2.0
-take_profit_zscore = 0.5
-stop_loss_zscore = 3
-reentry_delay = 30
-window_size = 60
-price_array = pl.read_parquet()
-price_array = price_array['AAL', 'AAPL', 
-                          'ADBE', 'ADI', 
-                          'ADP', 'ADSK', 
-                          'ALGN', 'ALXN', 
-                          'AMAT', 'AMGN', 
-                          'AMZN', 'ATVI', 
-                          'BIIB', 'BKNG']
+take_profit_zscore = 0.0
+stop_loss_zscore = 3.0
+reentry_delay = 10
+window_size = 10
+trading_cost = 0.0005
+
+price_array = pd.read_parquet(r"full_qqq.parquet")
+
+price_array = price_array[first_20]
+
 price_array = price_array.to_numpy()
 
+########################### fake data 2
+
+# Create sample datetime index
+p = 30
+ts_event = pd.date_range("2023-01-01", periods=p, freq="D")
+
+data = {
+    "BKNG": np.random.uniform(2000, 2100, p),
+    "DASH": np.random.uniform(100, 110, p),
+    "CRWD": np.random.uniform(150, 160, p),
+    "FTNT": np.random.uniform(50, 55, p),
+    "AAA": np.random.uniform(150, 160, p),
+    "BB": np.random.uniform(50, 55, p),
+    "SS": np.random.uniform(150, 160, p),
+    "XX": np.random.uniform(50, 55, p),
+    "FF": np.random.uniform(150, 160, p),
+    "QWE": np.random.uniform(50, 55, p),
+}
+
+df = pd.DataFrame(data, index=ts_event)
+df.index.name = "ts_event"
+price_array = df.to_numpy()
+
+window_size = 60
 beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, window_size = window_size)
-positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(price_array, beta_matrix, spread_matrix, zscore_matrix, window_size, max_positions = 2, entry_zscore = 2.0, take_profit_zscore = 0.5, stop_loss_zscore = 3, reentry_delay = 60)
+positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(price_array, beta_matrix, spread_matrix, zscore_matrix, window_size, 
+                                                                                      max_positions = max_positions, entry_zscore = entry_zscore, 
+                                                                                      take_profit_zscore = take_profit_zscore, stop_loss_zscore = stop_loss_zscore, 
+                                                                                      reentry_delay = reentry_delay, trading_cost = trading_cost)
+#aa = aa[2 * window_size - 3:, :]
+#bb = bb[2 * window_size - 3:, :]
+
+import matplotlib.pyplot as plt
+plt.plot(np.cumprod(1+returns_matrix[60:]))
+
+plt.show()
