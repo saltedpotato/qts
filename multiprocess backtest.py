@@ -45,7 +45,7 @@ def run(periods):
     # TRAINING PERIOD FINDING OPTIMAL PARAMS #
     data.read(cons=cons_date[train_end], start=warm_start, end=train_end)
 
-    train = data.filter(resample_freq="30m", hours=market_hours.MARKET)
+    train = data.filter(resample_freq="15m", hours=market_hours.MARKET)
 
     c = Clustering(df=train.select(pl.all().exclude(["date", "time"])))
 
@@ -140,6 +140,9 @@ def run(periods):
     ).write_csv(f"{out_path}/result/result_{next_day}_{trade_end}.csv")
 
     convert_json = {f"{p1}_{p2}": params for (p1, p2), params in optimal_params.items()}
+    convert_json["pairs_to_trade"] = p["pairs_to_trade"]
+    convert_json["buffer_capital"] = p["buffer_capital"]
+
     with open(
         f"{out_path}/params/optimal_params_{next_day}_{trade_end}.json", "w"
     ) as json_file:
@@ -162,7 +165,7 @@ if __name__ == "__main__":
         >= datetime.strptime("2020-06-30", "%Y-%m-%d").date()
     ]
 
-    periods = 20
+    periods = 30
 
     period_ends = (
         pl.DataFrame(earliest_date_year, schema=["Date"])
@@ -190,7 +193,7 @@ if __name__ == "__main__":
             )
         )
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(run, p) for p in periods]
         for future in concurrent.futures.as_completed(futures):
             try:
