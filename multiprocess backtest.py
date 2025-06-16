@@ -74,6 +74,7 @@ def run(periods):
 
     opt = optimizer(
         data=data,
+        cost=0.0005,
         find_pairs=find_pairs,  # list(params.keys()), # pairs_to_trade
         start=pl.lit(train_start).str.strptime(pl.Date, "%Y-%m-%d"),
         end=pl.lit(train_end).str.strptime(pl.Date, "%Y-%m-%d"),
@@ -157,7 +158,7 @@ if __name__ == "__main__":
     cons_date = cons.read()
 
     data = market_data(file_path="data/polygon/*.parquet")
-    out_path = "output/polygon"
+    out_path = "output/polygon/optimize_30d_w_cost_sharpe_scaled_z"
     earliest_date_year = [
         i
         for i in cons_date.keys()
@@ -193,7 +194,7 @@ if __name__ == "__main__":
             )
         )
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
         futures = [executor.submit(run, p) for p in periods]
         for future in concurrent.futures.as_completed(futures):
             try:

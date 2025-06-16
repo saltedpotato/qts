@@ -103,6 +103,10 @@ class PairsTrader:
                     window_size=self.this_param[PARAMS.z_win], min_periods=10
                 )
             ).alias(f"Z_{self.p1}_ON_{self.p2}")
+        ).with_columns(
+            pl.col(f"Z_{self.p1}_ON_{self.p2}")
+            .rolling_std(window_size=self.this_param[PARAMS.z_win], min_periods=10)
+            .alias(f"Z_VOL_{self.p1}_ON_{self.p2}")
         )
 
     @staticmethod
@@ -174,6 +178,7 @@ class PairsTrader:
         Z_arr: np.ndarray,
         # hurst_arr: np.ndarray,
         z_entry_arr: np.ndarray,
+        z_vol_arr: np.ndarray,
         z_exit_arr: np.ndarray,
         z_stop_arr: np.ndarray,
         cooldown_arr: np.ndarray,
@@ -193,31 +198,59 @@ class PairsTrader:
         np.ndarray,
     ]:
         """
-        Compute trading signals, positions, and associated betas for each pair.
+        Simulates the execution of pair trading strategies using z-score-based mean reversion logic.
 
         Parameters
         ----------
-        Z_arr : np.ndarray
-            Z-score time series, shape (n_rows, n_pairs).
-        beta_arr : np.ndarray
-            Estimated beta time series, shape (n_rows, n_pairs).
         n_pairs : int
             Number of trading pairs.
+        price_arr : np.ndarray
+            Price time series for all assets, shape (n_rows, 2 * n_pairs).
+        beta_arr : np.ndarray
+            Estimated hedge ratios (betas) between paired assets, shape (n_rows, n_pairs).
+        Z_arr : np.ndarray
+            Z-score time series representing the spread between pairs, shape (n_rows, n_pairs).
         z_entry_arr : np.ndarray
-            Z-score entry thresholds for each pair, shape (n_pairs,).
+            Entry threshold for z-score to open a position, shape (n_pairs,).
+        z_vol_arr : np.ndarray
+            Volatility-adjusted scaling factor for z-score thresholds, shape (n_rows,).
         z_exit_arr : np.ndarray
-            Z-score exit thresholds for each pair, shape (n_pairs,).
+            Exit threshold for z-score to close a position, shape (n_pairs,).
+        z_stop_arr : np.ndarray
+            Hard stop threshold for the z-score to force exit, shape (n_rows,).
+        cooldown_arr : np.ndarray
+            Cooldown periods after a stop-loss before a pair can trade again, shape (n_pairs,).
         market_close_flag : np.ndarray
-            Binary flags indicating when to flatten positions, shape (n_rows,).
+            Binary indicator (1 = close market), forcing all positions to close at that step, shape (n_rows,).
+        cost : float
+            Proportional transaction cost per trade (e.g., 0.001 for 0.1%).
+        stop_loss : np.ndarray
+            Maximum allowed drawdown (negative return) for each pair before triggering stop trading, shape (n_pairs,).
+        buffer_capital : float
+            Fraction of capital to keep as a buffer and not allocate to trades (e.g., 0.1 for 10%).
 
         Returns
         -------
         signal_arr : np.ndarray
-            Trade signals (-1: short, 0: no signal, 1: long), shape (n_rows, n_pairs).
+            Entry signals per pair (-2: strong short, -1: short, 0: none, 1: long, 2: strong long), shape (n_rows, n_pairs).
         pos_arr : np.ndarray
-            Open position per pair (-1: short, 0: flat, 1: long), shape (n_rows, n_pairs).
+            Position state per pair (-1: short, 0: flat, 1: long), shape (n_rows, n_pairs).
         pos_beta_arr : np.ndarray
-            Position beta value when open, 0 otherwise, shape (n_rows, n_pairs).
+            Hedge ratio (beta) held during each position, 0 if flat, shape (n_rows, n_pairs).
+        capital_allocation_arr : np.ndarray
+            Capital allocated to each pair at each timestep, shape (n_rows, n_pairs).
+        remaining_capital : np.ndarray
+            Capital not allocated to any trades (i.e., free capital), shape (n_rows,).
+        pair_base : np.ndarray
+            Baseline price level used for return normalization, shape (n_rows, n_pairs).
+        pair_return : np.ndarray
+            Calculated return of the pair’s position based on price changes, shape (n_rows, n_pairs).
+        SL_arr : np.ndarray
+            Binary indicator (1 = stop-loss triggered) for each pair at each timestep, shape (n_rows, n_pairs).
+        loss_arr : np.ndarray
+            Trailing drawdown percentage for each pair, shape (n_rows, n_pairs).
+        stop_trading_arr : np.ndarray
+            Countdown of cooldown periods after stop-loss, shape (n_rows, n_pairs).
         """
         n_rows = Z_arr.shape[0]
 
@@ -237,8 +270,8 @@ class PairsTrader:
             is_MR = False  # hurst_arr[i] < 0.5
 
             ########## GENERATE SIGNAL ##########
-            long_cond = Z_arr[i] < -z_entry_arr
-            short_cond = Z_arr[i] > z_entry_arr
+            long_cond = Z_arr[i] < -z_entry_arr * (1 + z_vol_arr[i])
+            short_cond = Z_arr[i] > z_entry_arr * (1 + z_vol_arr[i])
 
             signal_arr[i] = np.where(
                 (long_cond) & (~np.isnan(Z_arr[i])) & (is_MR),
@@ -255,8 +288,12 @@ class PairsTrader:
             )
 
             ########## CHECK EXITS OR STOP LOSS ##########
-            exit_long_cond = (Z_arr[i - 1] > z_exit_arr) | (Z_arr[i - 1] < -z_stop_arr)
-            exit_short_cond = (Z_arr[i - 1] < -z_exit_arr) | (Z_arr[i - 1] > z_stop_arr)
+            exit_long_cond = (Z_arr[i - 1] > z_exit_arr * (1 + z_vol_arr[i])) | (
+                Z_arr[i - 1] < -z_stop_arr * (1 + z_vol_arr[i])
+            )
+            exit_short_cond = (Z_arr[i - 1] < -z_exit_arr * (1 + z_vol_arr[i])) | (
+                Z_arr[i - 1] > z_stop_arr * (1 + z_vol_arr[i])
+            )
 
             pos_arr[i] = np.where(
                 (
@@ -422,232 +459,6 @@ class PairsTrader:
             stop_trading_arr,
         )
 
-    @cuda.jit
-    def compute_pos_cuda(
-        Z_arr,
-        beta_arr,
-        hurst_arr,
-        z_entry_arr,
-        z_exit_arr,
-        market_close_flag,
-        signal_arr,
-        pos_arr,
-        pos_beta_arr,
-        n_rows,
-        n_pairs,
-    ):
-        i = cuda.grid(1)
-        if i < 1 or i >= n_rows:
-            return
-
-        for j in range(n_pairs):
-            curr_Z = Z_arr[i, j]
-            prev_pos = pos_arr[i - 1, j]
-            curr_beta = beta_arr[i, j]
-            is_MR = hurst_arr[i] < 0.5
-
-            # Entry signal logic
-            if not np.isnan(curr_Z):
-                if curr_Z < -z_entry_arr[j]:
-                    signal_arr[i, j] = 2 if is_MR else 1
-                elif curr_Z > z_entry_arr[j]:
-                    signal_arr[i, j] = -2 if is_MR else -1
-                else:
-                    signal_arr[i, j] = 0
-            else:
-                signal_arr[i, j] = 0
-
-            curr_signal = signal_arr[i, j]
-            exit_long_cond = curr_Z > z_exit_arr[j]
-            exit_short_cond = curr_Z < -z_exit_arr[j]
-
-            if (
-                (prev_pos == 1 and exit_long_cond and not np.isnan(curr_Z))
-                or (prev_pos == -1 and exit_short_cond and not np.isnan(curr_Z))
-                or (market_close_flag[i] == 1)
-            ):
-                pos_arr[i, j] = 0
-            elif (
-                prev_pos == 0
-                and curr_signal < 0
-                and not np.isnan(curr_beta)
-                and market_close_flag[i] == 0
-                and abs(curr_beta) <= 2
-            ):
-                pos_arr[i, j] = -1
-            elif (
-                prev_pos == 0
-                and curr_signal > 0
-                and not np.isnan(curr_beta)
-                and market_close_flag[i] == 0
-                and abs(curr_beta) <= 2
-            ):
-                pos_arr[i, j] = 1
-            else:
-                pos_arr[i, j] = prev_pos
-
-            if prev_pos == 0 and pos_arr[i, j] != 0:
-                pos_beta_arr[i, j] = curr_beta
-            elif prev_pos != 0 and pos_arr[i, j] == 0:
-                pos_beta_arr[i, j] = 0
-            else:
-                pos_beta_arr[i, j] = pos_beta_arr[i - 1, j]
-
-    @staticmethod
-    @njit
-    def capital_allocation_ret(
-        price_arr: np.ndarray,
-        z_arr: np.ndarray,
-        z_stop_arr: np.ndarray,
-        pos_beta_arr: np.ndarray,
-        pos_arr: np.ndarray,
-        n_pairs: int,
-        cost: float,
-        stop_loss: np.ndarray,
-        buffer_capital: float,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute capital allocation and capital over time.
-
-        Parameters
-        ----------
-        pair_ret_arr : np.ndarray
-            Returns per pair, shape (n_rows, n_pairs).
-        pos_arr : np.ndarray
-            Position matrix (-1, 0, 1), shape (n_rows, n_pairs).
-        n_pairs : int
-            Number of pairs.
-        cost : float
-            market impact per entry/exit as a proportion (e.g. 0.001 for 0.1%).
-        stop_loss : np.ndarray
-            interval returns stop loss, stop trading the pair for the month if hit (e.g. 0.001 for 0.1%).
-
-        Returns
-        -------
-        capital_allocation_arr : np.ndarray
-            Capital allocated per pair over time, shape (n_rows, n_pairs).
-        remaining_capital : np.ndarray
-            Remaining float capital not currently deployed, shape (n_rows,).
-        """
-        n_rows = pos_arr.shape[0]
-        pair_base = np.zeros((n_rows, n_pairs))
-        pair_return = np.zeros((n_rows, n_pairs))
-        capital_allocation_arr = np.zeros((n_rows, n_pairs))  # shape: n rows, n pairs
-        remaining_capital = np.ones(n_rows)
-        loss_arr = np.zeros((n_rows, n_pairs))
-        SL_arr = np.zeros((n_rows, n_pairs))
-
-        for i in range(1, n_rows):
-            new_pos = ((pos_arr[i - 1] == 0) & (pos_arr[i] != 0)).astype(np.int32)
-            close_pos = ((pos_arr[i - 1] != 0) & (pos_arr[i] == 0)).astype(np.int32)
-
-            for pair in prange(n_pairs):
-                if new_pos[pair] == 1:
-                    pair_base[i - 1][pair] = price_arr[i - 1][2 * pair] + price_arr[
-                        i - 1
-                    ][2 * pair + 1] * np.abs(pos_beta_arr[i][pair])
-
-                if pos_arr[i][pair] == 1 or close_pos[pair] == 1:
-                    prev_mv = (
-                        price_arr[i - 1][2 * pair]  # long y
-                        - price_arr[i - 1][2 * pair + 1]
-                        * pos_beta_arr[i][pair]  # short Bx
-                    )
-                    curr_mv = (
-                        price_arr[i][2 * pair]  # long y
-                        - price_arr[i][2 * pair + 1] * pos_beta_arr[i][pair]  # short Bx
-                    )
-
-                elif pos_arr[i][pair] == -1 or close_pos[pair] == 1:
-                    prev_mv = (
-                        -price_arr[i - 1][2 * pair]  # long y
-                        + price_arr[i - 1][2 * pair + 1]
-                        * pos_beta_arr[i][pair]  # short Bx
-                    )
-                    curr_mv = (
-                        -price_arr[i][2 * pair]  # short y
-                        + price_arr[i][2 * pair + 1] * pos_beta_arr[i][pair]  # long Bx
-                    )
-                else:
-                    pair_base[i][pair] = 0
-                    pair_return[i][pair] = 0
-                    continue
-
-                pair_base[i][pair] = price_arr[i][2 * pair] + price_arr[i][
-                    2 * pair + 1
-                ] * np.abs(pos_beta_arr[i][pair])
-                pair_return[i][pair] = (curr_mv - prev_mv) / pair_base[i - 1][pair]
-
-            for pair in prange(n_pairs):
-                # if capital wasnt 0, check for cumulative returns
-                check_loss_arr = capital_allocation_arr.T[pair]
-                if check_loss_arr[i - 1] != 0:
-                    for lookback in range(i - 1, -1, -1):
-                        # find when capital was last 0
-                        if (
-                            check_loss_arr[lookback] == 0
-                            and np.max(check_loss_arr[lookback + 1 : i]) != 0
-                        ):
-                            loss_arr[i][pair] = (
-                                # trailing stop loss
-                                check_loss_arr[i - 1]
-                                / np.max(check_loss_arr[lookback + 1 : i])
-                            ) - 1
-                            break
-
-            # check stops
-            SL_arr[i] = np.where(
-                (loss_arr[i] <= -stop_loss) | (z_arr[i] > z_stop_arr), 1, 0
-            )
-
-            this_remaining_capital = remaining_capital[i - 1]
-            curr_SL = SL_arr[i]
-
-            if np.any(close_pos) or np.any(curr_SL):
-                # if close position or stoploss hit, return capital
-                for pair in prange(n_pairs):
-                    if close_pos[pair] == 1 or curr_SL[pair] == 1:
-                        this_remaining_capital += (
-                            (1 + pos_arr[i][pair] * pair_return[i][pair])
-                            * capital_allocation_arr[i - 1][pair]
-                            * (1 - cost)
-                        )
-                        capital_allocation_arr[i - 1][pair] = 0
-                    if curr_SL[pair] == 1:  # stop trading the pair for this period
-                        pos_arr = pos_arr.T
-                        for future_pos in range(i, n_rows):
-                            if pos_arr[pair][future_pos] == 0:
-                                break
-                            pos_arr[pair][future_pos] = 0
-                        pos_arr = pos_arr.T
-                        new_pos[pair] = 0
-
-            if np.any(new_pos):
-                # if multiple signals, then equally divide capital
-                deployable_capital = (
-                    (this_remaining_capital) / (sum(new_pos)) * (1 - buffer_capital)
-                )
-                for j in prange(n_pairs):
-                    if new_pos[j] == 1:
-                        allocation = deployable_capital * new_pos[j]
-                        capital_allocation_arr[i - 1][j] = allocation * (1 - cost)
-                        this_remaining_capital -= allocation
-            # float capital returns
-            capital_allocation_arr[i] = (
-                1 + pos_arr[i] * pair_return[i]
-            ) * capital_allocation_arr[i - 1]
-            remaining_capital[i - 1] = this_remaining_capital
-            remaining_capital[i] = this_remaining_capital
-
-        return (
-            capital_allocation_arr,
-            remaining_capital,
-            pair_base,
-            pair_return,
-            SL_arr,
-            loss_arr,
-        )
-
     def generate_backtest_df(self) -> pl.DataFrame:
         """
         Generate a backtest dataframe by computing beta, spread, and z-score for each pair.
@@ -769,6 +580,10 @@ class PairsTrader:
             [f"BETA_{p1}_ON_{p2}" for p1, p2 in self.pairs]
         ).to_numpy()  # shape: n rows, n pairs
 
+        z_vol_arr = df.select(
+            [f"Z_VOL_{p1}_ON_{p2}" for p1, p2 in self.pairs]
+        ).to_numpy()
+
         # hurst_arr = df.select(
         #     # select reorders the columns
         #     [f"HURST_{p1}_ON_{p2}" for p1, p2 in self.pairs]
@@ -781,8 +596,7 @@ class PairsTrader:
         )
         z_exit_arr = np.array([self.params[pair][PARAMS.z_exit] for pair in self.pairs])
         z_stop_arr = z_entry_arr * (
-            1
-            + np.array([self.params[pair][PARAMS.z_stop_scaler] for pair in self.pairs])
+            np.array([self.params[pair][PARAMS.z_stop_scaler] for pair in self.pairs])
         )
         cooldown_arr = (
             np.array(
@@ -825,6 +639,7 @@ class PairsTrader:
             Z_arr=Z_arr,
             # hurst_arr,
             z_entry_arr=z_entry_arr,
+            z_vol_arr=z_vol_arr,
             z_exit_arr=z_exit_arr,
             z_stop_arr=z_stop_arr,
             cooldown_arr=cooldown_arr,
