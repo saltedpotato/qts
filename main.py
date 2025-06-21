@@ -1,11 +1,12 @@
-
 from datetime import datetime
 import polars as pl
+import pandas as pd
 
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
-from numba import njit
-from pairs_identification import cointegration_pairs
+from numba import njit, prange
+
+from itertools import combinations
 
 # note! need to ensure to get (2xwindow_size - 2) more datapoints so it neatly dropna into start of quarter
 # drop 1 LESS for returns calculation
@@ -15,7 +16,109 @@ from pairs_identification import cointegration_pairs
 # to do - need to drop first row after compute_positions?
 # !!!! REMOVE WINDOW_SIZE WILL NOT NEED AFTERWARDS IN COMPUTE_POSITIONS !!!!!!
 class PairsBacktester():
+    
+    @staticmethod
+    @njit(parallel = True)
+    def rank_cointegrated_pairs(price_data: np.ndarray,
+                                pair_indices: np.ndarray
+                                ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Estimate ADF-like test statistics in parallel for multiple stock pairs.
+    
+        This function approximates cointegration by regressing the first difference of the spread
+        on the lagged spread for each pair and extracting the autoregressive coefficient (tau).
+        More negative tau implies stronger mean-reversion.
+    
+        Parameters
+        ----------
+        price_data : np.ndarray
+            A 2D array of shape (T, N) where T is the number of time points and N is the number of assets.
+            Each column represents a time series of one asset's prices.
+        pair_indices : np.ndarray
+            A 2D array of shape (M, 2), where each row contains the (i, j) index pair for the price_data columns to be tested.
+    
+        Returns
+        -------
+        tau_stats : np.ndarray
+            Array of shape (M,) containing the estimated AR(1) coefficients from the ADF-like test for each pair.
+            More negative values suggest stronger evidence of cointegration.
+        valid_flags : np.ndarray
+            Binary array of shape (M,), where 1 indicates a valid stat (no NaNs encountered), 0 means skipped.
+        """
+    
+        # M = number of pairs, T = number of time periods
+        n_pairs     = pair_indices.shape[0]
+        n_timesteps = price_data.shape[0]
+    
+        # initialize output arrays
+        tau_stats   = np.full(n_pairs, 999.0)     # use 999.0 as a placeholder for "invalid"
+        valid_flags = np.zeros(n_pairs)         # 0 = invalid, 1 = valid
+    
+        # loop through each pair in parallel
+        for k in prange(n_pairs):
+            
+            i, j = pair_indices[k]              # get indices for this pair
+            x    = price_data[:, i]                # time series for asset i
+            y    = price_data[:, j]                # time series for asset j
+    
+            # skip any pair that contains NaNs
+            if np.any(np.isnan(x)) or np.any(np.isnan(y)):
+                continue
+    
+            # compute hedge ratio using simple OLS: beta = cov(x, y) / var(x)
+            mean_x = x.mean()
+            mean_y = y.mean()
+    
+            cov = np.mean((x - mean_x) * (y - mean_y))      # sample covariance
+            var = np.mean((x - mean_x) ** 2)                # sample variance
+    
+            # fallback if variance is zero (flat series)
+            beta = cov / var if var > 0 else 1.0
+    
+            # construct spread: y - beta * x
+            spread = y - beta * x
+    
+            # compute first difference of spread (dy)
+            difference = spread[1:] - spread[:-1]
+    
+            # lagged spread (y_{t-1})
+            y_lag = spread[:-1]
+    
+            # build regression matrix X = [y_lag, 1]
+            X       = np.empty((n_timesteps - 1, 2))
+            X[:, 0] = y_lag                   # lagged spread
+            X[:, 1] = 1.0                     # constant intercept term
+    
+            # manually compute beta = (X'X)^-1 X'y using closed-form 2x2 inversion
+            Xt  = X.T                         # transpose X: shape (2, T-1)
+            XtX = Xt @ X                     # X'X: shape (2, 2)
+            Xty = Xt @ difference            # X'y: shape (2,)
+    
+            # compute determinant of XtX for inversion
+            det = XtX[0, 0] * XtX[1, 1] - XtX[0, 1] * XtX[1, 0]
+    
+            if np.abs(det) > 1e-8:           # make sure matrix is invertible
+                inv_XtX = np.empty((2, 2))   # initialize inverse matrix
+    
+                # 2x2 matrix inversion
+                inv_XtX[0, 0] = XtX[1, 1] / det
+                inv_XtX[1, 1] = XtX[0, 0] / det
+                inv_XtX[0, 1] = -XtX[0, 1] / det
+                inv_XtX[1, 0] = -XtX[1, 0] / det
+    
+                # estimated OLS betas = [tau, intercept]
+                beta_ols = inv_XtX @ Xty
+                tau      = beta_ols[0]            # only care about coefficient of y_{t-1}
+            else:
+                tau = 999.0                  # fallback for singular matrix
+    
+            # store result
+            tau_stats[k]   = tau
+            valid_flags[k] = 1               # mark as valid
+    
+        return tau_stats, valid_flags
 
+    
     @staticmethod
     @njit
     def compute_rolling_zscore(price_array: np.ndarray, 
@@ -70,7 +173,7 @@ class PairsBacktester():
         spread_matrix = np.full((n_timesteps, n_pairs), np.nan, dtype = np.float64)
         zscore_matrix = np.full((n_timesteps, n_pairs), np.nan, dtype = np.float64)
         
-        for j in range(n_pairs):
+        for j in prange(n_pairs):
             x = price_array[:, 2 * j]
             y = price_array[:, 2 * j + 1]
         
@@ -88,7 +191,7 @@ class PairsBacktester():
             y_rolling   = as_strided(y, shape = shape, strides = (stride, stride))
             
             # compute beta for each timestep
-            for i in range(n_timesteps - window_size + 1):
+            for i in prange(n_timesteps - window_size + 1):
                 x_window = x_rolling[i]
                 y_window = y_rolling[i]
                 
@@ -113,7 +216,7 @@ class PairsBacktester():
             spread = np.full(n_timesteps, np.nan, dtype = np.float64)
             
             #start from window_size - 1 since already np.nan intialized
-            for i in range(window_size - 1, n_timesteps): 
+            for i in prange(window_size - 1, n_timesteps): 
                 spread[i] = y[i] - (beta[i] * x[i])
                 
             spread_matrix[:, j] = spread
@@ -127,7 +230,7 @@ class PairsBacktester():
             stride          = spread.strides[0]
             spread_rolling  = as_strided(spread, shape = shape, strides = (stride, stride))
         
-            for i in range(n_timesteps - window_size + 1):
+            for i in prange(n_timesteps - window_size + 1):
                 spread_window   = spread_rolling[i]
                 spread_mean     = np.nanmean(spread_window)
                 spread_std      = np.nanstd(spread_window)
@@ -237,7 +340,7 @@ class PairsBacktester():
         x_price_matrix = np.empty((n_timesteps, n_pairs), dtype = np.float64)
         y_price_matrix = np.empty((n_timesteps, n_pairs), dtype = np.float64)
         
-        for col in range(n_pairs):
+        for col in prange(n_pairs):
             x_price_matrix[:, col] = price_array[:, 2 * col]
             y_price_matrix[:, col] = price_array[:, 2 * col + 1]
 
@@ -296,8 +399,8 @@ class PairsBacktester():
                         t_weights[j] = 0.0 # clear out position
                         beta_tracker[j] = 0.0 # clear beta cache
 
-                        tm1_y_price[j] -= trading_cost # short Y at lower price
-                        tm1_x_price[j] += trading_cost # long X at higher price
+                        tm1_y_price[j] *= (1 - trading_cost) # short Y at lower price
+                        tm1_x_price[j] *= (1 + trading_cost) # long X at higher price
                         
                     elif tm1_zscore[j] <= -stop_loss_zscore: # if reach stop loss!
                         t_positions[j] = 0 # stop loss
@@ -307,8 +410,8 @@ class PairsBacktester():
                         beta_tracker[j] = 0.0 # clear beta cache
                         delay_tracker[j] = reentry_delay # CANNOT BUY INSTANTLY NEXT PERIOD
                         
-                        tm1_y_price[j] -= trading_cost # short Y at lower price
-                        tm1_x_price[j] += trading_cost # long X at higher price
+                        tm1_y_price[j] *= (1 - trading_cost) # short Y at lower price
+                        tm1_x_price[j] *= (1 + trading_cost) # long X at higher price
                         
                 elif tm1_positions[j] == -1: # if short position, check tp/sl
 
@@ -319,8 +422,8 @@ class PairsBacktester():
                         t_weights[j] = 0.0 # clear out position
                         beta_tracker[j] = 0.0 # clear beta cache
 
-                        tm1_y_price[j] += trading_cost # buy Y at higher price
-                        tm1_x_price[j] -= trading_cost # short X at lower price
+                        tm1_y_price[j] *= (1 + trading_cost) # buy Y at higher price
+                        tm1_x_price[j] *= (1 - trading_cost) # short X at lower price
                         
                     elif tm1_zscore[j] >= stop_loss_zscore: # if reach stop loss ALREADY DIE LAST PERIOD
 
@@ -331,8 +434,8 @@ class PairsBacktester():
                         beta_tracker[j] = 0.0 # clear beta cache
                         delay_tracker[j] = reentry_delay # CANNOT BUY INSTANTLY NEXT PERIOD
                         
-                        tm1_y_price[j] += trading_cost # buy Y at higher price
-                        tm1_x_price[j] -= trading_cost # short X at lower price
+                        tm1_y_price[j] *= (1 + trading_cost) # buy Y at higher price
+                        tm1_x_price[j] *= (1 - trading_cost) # short X at lower price
                         
             
             # get number of currently open positions, after checking SL/TP but BEFORE new entry in current timestep
@@ -367,7 +470,7 @@ class PairsBacktester():
                 max_new_positions = max_positions - n_open_positions # HOW MANY CAN WE BUY ACTUALLY
                 
                 temp_array = np.abs(tm1_zscore) # temp variable to rank zscores
-                for m in range(n_pairs): # ignore all pairs that recently exited
+                for m in prange(n_pairs): # ignore all pairs that recently exited
                     if delay_tracker[m] != 0:
                         temp_array[m] = 0
                     if t_positions[m] != 0:
@@ -384,8 +487,8 @@ class PairsBacktester():
                         t_weights[-1] -= t_weights[a] # remove weight from cash
                         beta_tracker[a] = tm1_beta[a] # track entry beta
                         
-                        tm1_y_price[a] -= trading_cost # short Y at lower price
-                        tm1_x_price[a] += trading_cost # long X at higher price
+                        tm1_y_price[a] *= (1 - trading_cost) # short Y at lower price
+                        tm1_x_price[a] *= (1 + trading_cost) # long X at higher price
                         
                     elif tm1_positions[a] == 0 and tm1_zscore[a] <= -entry_zscore: # if no active posn + long signal cus spread too narrow
                         t_positions[a] = 1 # long the spread
@@ -393,8 +496,8 @@ class PairsBacktester():
                         t_weights[-1] -= t_weights[a] # remove weight from cash
                         beta_tracker[a] = tm1_beta[a] # track entry beta
 
-                        tm1_y_price[a] += trading_cost # buy Y at higher price
-                        tm1_x_price[a] -= trading_cost # short X at lower price
+                        tm1_y_price[a] *= (1 + trading_cost) # buy Y at higher price
+                        tm1_x_price[a] *= (1 - trading_cost) # short X at lower price
                         
             # YOLO TRADE LETS GO
             else: # means (n_new_positions + n_open_positions) <= max_positions. nothing breaking. within limits
@@ -409,8 +512,8 @@ class PairsBacktester():
                         t_weights[-1] -= t_weights[b]# DEDUCT CASH
                         beta_tracker[b] = tm1_beta[b] # track entry beta
                         
-                        tm1_y_price[b] -= trading_cost # short Y at lower price
-                        tm1_x_price[b] += trading_cost # long X at higher price
+                        tm1_y_price[b] *= (1 - trading_cost) # short Y at lower price
+                        tm1_x_price[b] *= (1 + trading_cost) # long X at higher price
                         
                     elif tm1_positions[b] == 0 and tm1_zscore[b] <= -entry_zscore and delay_tracker[b] == 0: # if no active posn + long signal + not recent slcus spread too narrow
 
@@ -419,8 +522,8 @@ class PairsBacktester():
                         t_weights[-1] -= t_weights[b] # DEDUCT CASH
                         beta_tracker[b] = tm1_beta[b] # track entry beta
 
-                        tm1_y_price[b] += trading_cost # buy Y at higher price
-                        tm1_x_price[b] -= trading_cost # short X at lower price
+                        tm1_y_price[b] *= (1 + trading_cost) # buy Y at higher price
+                        tm1_x_price[b] *= (1 - trading_cost) # short X at lower price
                         
             #########################################################################
             #################### STEP 2.3 : COMPUTE WGTS & RTNS #####################
@@ -457,11 +560,12 @@ class PairsBacktester():
         return positions_matrix, weights_matrix, returns_matrix
 
 
+
     
 quarters = [
     (datetime(2020, 6, 1), datetime(2020, 9, 1)),
     (datetime(2020, 9, 1), datetime(2020, 12, 1)),
-    (datetime(2020, 12, 1), datetime(2021, 3, 1)),
+    (datetime(2020, 12, 1), datetime(2021, 3, 1)), 
     (datetime(2021, 3, 1), datetime(2021, 6, 1)),
     (datetime(2021, 6, 1), datetime(2021, 9, 1)),
     (datetime(2021, 9, 1), datetime(2021, 12, 1)),
@@ -478,35 +582,83 @@ quarters = [
     (datetime(2024, 6, 1), datetime(2024, 9, 1)),
     (datetime(2024, 9, 1), datetime(2024, 12, 1)),
     (datetime(2024, 12, 1), datetime(2025, 3, 1)),
-    (datetime(2025, 3, 1), datetime(2025, 6, 1)),
+    (datetime(2025, 3, 1), datetime(2025, 6, 1))
     ]
 
-first_20 = ['NLOK', 'CPRT', 'CTAS', 'NLOK', 'XEL', 'ROP', 'FB', 'AVGO', 'LULU', 'NLOK', 'TMUS', 'WDC', 'INCY', 'VRTX', 'JBHT', 'NXPI', 'JBHT', 'ON', 'EA', 'DXCM', 
-            'DIS', 'NLOK', 'NLOK', 'ON', 'KHC', 'ON', 'AAL', 'REGN', 'AVGO', 'NLOK', 'COST', 'ON', 'MNST', 'ENPH', 'VRSK', 'ON', 'XLNX', 'KDP', 'ADBE', 'ADSK']
 
+n_coint_pairs = 10
+max_positions = 4
+entry_zscore = 2.5
+take_profit_zscore = 0.5
+stop_loss_zscore = 3.0
+reentry_delay = 10
+window_size = 10
+trading_cost = 0.0001
 
-from utils.market_time import market_hours
-from utils.params import PARAMS
-from utils.clustering_methods import Clustering_methods
+flattened_list = []
+returns_array = np.array([])
 
-from pairs_finding.pairs_identification import cointegration_pairs
-from pairs_finding.clustering import Clustering
-    
 for period in quarters:
     print(period)
-    main_df = pl.read_parquet(r"full_qqq.parquet")
-    main_df = main_df.filter((pl.col("t") >= period[0]) & (pl.col("t") < period[1]))
-        
-    coint_model = cointegration_pairs(df=main_df, p_val_cutoff=0.05)
-    coint_model.identify_pairs()
-    pairs = coint_model.get_top_pairs()
-    print(pairs)
-    saved_pairs.append(pairs)
-    break
+    
+    # slice the file to qtr
+    main_df = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
+    main_df = main_df[(main_df["t"] >= period[0]) & (main_df["t"] < period[1])]
+    main_df = main_df.drop(columns=['t'])
+    main_df = main_df.ffill().dropna(axis = 1).dropna(axis = 0).astype(np.float64)
+    
+    # Filter price columns
+    symbols = [col for col in main_df.columns if col != "t"]  # exclude timestamp
+    price_array = main_df[symbols].to_numpy()  # T x N matrix (prices only)
+    
+    # Create all unique pair index combinations
+    pair_indices = np.array(list(combinations(range(len(symbols)), 2)))  # shape (M, 2)
+    
+    # Run the Numba-parallel ADF proxy
+    tau_stats, valid_flags = PairsBacktester.rank_cointegrated_pairs(price_array, pair_indices)
+    
+    # Extract top N pairs by most negative tau
+    valid_idx = np.where(valid_flags == 1)[0]
+    sorted_idx = valid_idx[np.argsort(tau_stats[valid_idx])]
+
+    top_pairs = [pair_indices[i] for i in sorted_idx[:n_coint_pairs]]
+    
+    # Convert index pairs to ticker symbols and show tau
+    top_pairs_named = [(symbols[i], symbols[j], tau_stats[idx]) for idx, (i, j) in zip(sorted_idx[:n_coint_pairs], top_pairs)]
+    top_pair_tuples = [(i, j) for i, j, _ in top_pairs_named]
+    
+    if flattened_list == []:
+        flattened_list = [item for tup in top_pair_tuples for item in tup]
+        continue
+    
+    flattened_list = [item for tup in top_pair_tuples for item in tup]
+    
+    main_df = main_df[flattened_list]
+    main_df = main_df.ffill().dropna(axis = 1).dropna(axis = 0).astype(np.float64)
+    
+    price_array = main_df.to_numpy()
+    del main_df
+    
+    beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, window_size = window_size)
+    positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(price_array, beta_matrix, spread_matrix, zscore_matrix, window_size, 
+                                                                                          max_positions = max_positions, entry_zscore = entry_zscore, 
+                                                                                          take_profit_zscore = take_profit_zscore, stop_loss_zscore = stop_loss_zscore, 
+                                                                                          reentry_delay = reentry_delay, trading_cost = trading_cost)
+    
+    returns_array = np.concatenate((returns_array, returns_matrix))
+    # Convert to DataFrame
+    df = pd.DataFrame(returns_array)
+    
+    # Save to Parquet
+    #df.to_parquet("my_array2.parquet", index=False)
+    
+import matplotlib.pyplot as plt
+plt.plot(np.cumprod(1+returns_matrix[60:]))
+plt.show()
 
 #############
 
-c = Clustering(df=main_df.select(pl.all().exclude(["date", "time"])))
+c = Clustering(df=main_df.select(pl.all().exclude(["t"])))
 c.run_clustering(method=Clustering_methods.agnes, min_clusters=2, max_clusters=5)
     
 find_pairs = cointegration_pairs(
@@ -514,26 +666,20 @@ find_pairs = cointegration_pairs(
     p_val_cutoff=0.01,
     cluster_pairs=c.cluster_pairs,
 )
-
+find_pairs.identify_pairs()
 pairs = find_pairs.get_top_pairs()
-
+flattened_list = [item for tup in pairs for item in tup]
 
 ############################ fake data 1
 import polars as pl
 import numpy as np
-import pandas as pd
 
-max_positions = 2
-entry_zscore = 2.0
-take_profit_zscore = 0.0
-stop_loss_zscore = 3.0
-reentry_delay = 10
-window_size = 10
-trading_cost = 0.0005
 
-price_array = pd.read_parquet(r"full_qqq.parquet")
 
-price_array = price_array[first_20]
+
+price_array = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
+
+price_array = price_array[["AAPL", "GOOG"]]
 
 price_array = price_array.to_numpy()
 
@@ -573,3 +719,6 @@ import matplotlib.pyplot as plt
 plt.plot(np.cumprod(1+returns_matrix[60:]))
 
 plt.show()
+
+
+#test = pd.read_json(r"C:\Users\Zeke\Downloads\j.json")
