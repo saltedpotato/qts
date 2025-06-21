@@ -446,7 +446,7 @@ class PairsBacktester():
             temp_array = np.full(n_pairs, 0, dtype = int) # temp variable to count new positions
             
             for k in range(n_pairs):# ignore all pairs that recently exited
-                if tm1_positions[k] ==0 and np.abs(tm1_zscore[k]) >= entry_zscore and delay_tracker[k] == 0 and abs(tm1_beta[k]) < 2:
+                if tm1_positions[k] ==0 and np.abs(tm1_zscore[k]) >= entry_zscore and delay_tracker[k] == 0 and abs(tm1_beta[k]) < 1.0:
                     temp_array[k] = 1
 
             n_new_positions = np.sum(temp_array)
@@ -587,12 +587,12 @@ quarters = [
 
 
 n_coint_pairs = 10
-max_positions = 4
-entry_zscore = 2.5
-take_profit_zscore = 0.5
+max_positions = 1
+entry_zscore = 2.0
+take_profit_zscore = 0.0
 stop_loss_zscore = 3.0
 reentry_delay = 10
-window_size = 10
+window_size = 60
 trading_cost = 0.0001
 
 flattened_list = []
@@ -602,7 +602,7 @@ for period in quarters:
     print(period)
     
     # slice the file to qtr
-    main_df = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
+    main_df = pd.read_parquet(r"C:\Users\zk_me\Downloads\full_qqq.parquet")
     main_df = main_df[(main_df["t"] >= period[0]) & (main_df["t"] < period[1])]
     main_df = main_df.drop(columns=['t'])
     main_df = main_df.ffill().dropna(axis = 1).dropna(axis = 0).astype(np.float64)
@@ -626,18 +626,15 @@ for period in quarters:
     # Convert index pairs to ticker symbols and show tau
     top_pairs_named = [(symbols[i], symbols[j], tau_stats[idx]) for idx, (i, j) in zip(sorted_idx[:n_coint_pairs], top_pairs)]
     top_pair_tuples = [(i, j) for i, j, _ in top_pairs_named]
-    
+
     if flattened_list == []:
         flattened_list = [item for tup in top_pair_tuples for item in tup]
         continue
-    
-    flattened_list = [item for tup in top_pair_tuples for item in tup]
-    
+        
     main_df = main_df[flattened_list]
-    main_df = main_df.ffill().dropna(axis = 1).dropna(axis = 0).astype(np.float64)
+    #main_df = main_df.ffill().dropna(axis = 1).dropna(axis = 0).astype(np.float64)
     
     price_array = main_df.to_numpy()
-    del main_df
     
     beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, window_size = window_size)
     positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(price_array, beta_matrix, spread_matrix, zscore_matrix, window_size, 
@@ -646,79 +643,12 @@ for period in quarters:
                                                                                           reentry_delay = reentry_delay, trading_cost = trading_cost)
     
     returns_array = np.concatenate((returns_array, returns_matrix))
-    # Convert to DataFrame
-    df = pd.DataFrame(returns_array)
     
+    flattened_list = [item for tup in top_pair_tuples for item in tup]
+
     # Save to Parquet
     #df.to_parquet("my_array2.parquet", index=False)
     
 import matplotlib.pyplot as plt
 plt.plot(np.cumprod(1+returns_matrix[60:]))
 plt.show()
-
-#############
-
-c = Clustering(df=main_df.select(pl.all().exclude(["t"])))
-c.run_clustering(method=Clustering_methods.agnes, min_clusters=2, max_clusters=5)
-    
-find_pairs = cointegration_pairs(
-    df = main_df.select(pl.all().exclude(["date", "time"])),
-    p_val_cutoff=0.01,
-    cluster_pairs=c.cluster_pairs,
-)
-find_pairs.identify_pairs()
-pairs = find_pairs.get_top_pairs()
-flattened_list = [item for tup in pairs for item in tup]
-
-############################ fake data 1
-import polars as pl
-import numpy as np
-
-
-
-
-price_array = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
-
-price_array = price_array[["AAPL", "GOOG"]]
-
-price_array = price_array.to_numpy()
-
-########################### fake data 2
-
-# Create sample datetime index
-p = 30
-ts_event = pd.date_range("2023-01-01", periods=p, freq="D")
-
-data = {
-    "BKNG": np.random.uniform(2000, 2100, p),
-    "DASH": np.random.uniform(100, 110, p),
-    "CRWD": np.random.uniform(150, 160, p),
-    "FTNT": np.random.uniform(50, 55, p),
-    "AAA": np.random.uniform(150, 160, p),
-    "BB": np.random.uniform(50, 55, p),
-    "SS": np.random.uniform(150, 160, p),
-    "XX": np.random.uniform(50, 55, p),
-    "FF": np.random.uniform(150, 160, p),
-    "QWE": np.random.uniform(50, 55, p),
-}
-
-df = pd.DataFrame(data, index=ts_event)
-df.index.name = "ts_event"
-price_array = df.to_numpy()
-
-window_size = 60
-beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, window_size = window_size)
-positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(price_array, beta_matrix, spread_matrix, zscore_matrix, window_size, 
-                                                                                      max_positions = max_positions, entry_zscore = entry_zscore, 
-                                                                                      take_profit_zscore = take_profit_zscore, stop_loss_zscore = stop_loss_zscore, 
-                                                                                      reentry_delay = reentry_delay, trading_cost = trading_cost)
-#aa = aa[2 * window_size - 3:, :]
-#bb = bb[2 * window_size - 3:, :]
-
-import matplotlib.pyplot as plt
-plt.plot(np.cumprod(1+returns_matrix[60:]))
-
-plt.show()
-
-
-#test = pd.read_json(r"C:\Users\Zeke\Downloads\j.json")
