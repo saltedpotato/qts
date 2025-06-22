@@ -45,13 +45,13 @@ def run(periods):
     # TRAINING PERIOD FINDING OPTIMAL PARAMS #
     data.read(cons=cons_date[train_end], start=warm_start, end=train_end)
 
-    train = data.filter(resample_freq="15m", hours=market_hours.MARKET)
+    train = data.filter(resample_freq="30m", hours=market_hours.MARKET)
 
     c = Clustering(df=train.select(pl.all().exclude(["date", "time"])))
 
     # c.run_clustering(method=Clustering_methods.kmeans, min_clusters=2, max_clusters=10)
 
-    c.run_clustering(method=Clustering_methods.agnes, min_clusters=2, max_clusters=5)
+    c.run_clustering(method=Clustering_methods.agnes, min_clusters=2, max_clusters=10)
 
     find_pairs = cointegration_pairs(
         df=train.select(pl.all().exclude(["date", "time"])),
@@ -85,7 +85,7 @@ def run(periods):
     study = opt.optimize(
         study_name="PAIRS_TRADING",
         output_file_name=f"{out_path}/db/result_{next_day}_{trade_end}.db",
-        n_trials=150,
+        n_trials=100,
     )
     p = study.best_params
 
@@ -158,7 +158,7 @@ if __name__ == "__main__":
     cons_date = cons.read()
 
     data = market_data(file_path="data/polygon/*.parquet")
-    out_path = "output/polygon/optimize_30d_w_cost_sharpe_scaled_z"
+    out_path = "output/polygon/optimize_60d_w_cost_sharpe_scaled_z_longer_beta_hurst"
     earliest_date_year = [
         i
         for i in cons_date.keys()
@@ -166,7 +166,7 @@ if __name__ == "__main__":
         >= datetime.strptime("2020-06-30", "%Y-%m-%d").date()
     ]
 
-    periods = 30
+    periods = 60
 
     period_ends = (
         pl.DataFrame(earliest_date_year, schema=["Date"])
@@ -181,10 +181,10 @@ if __name__ == "__main__":
     )
 
     periods = []
-    for i in range(10, len(period_ends)):  # range(2, len(period_ends))
+    for i in range(5, len(period_ends)):  # range(2, len(period_ends))
         periods.append(
             (
-                period_ends[i - 10],
+                period_ends[i - 5],
                 period_ends[i - 2],
                 period_ends[i - 1],
                 period_ends[i],
@@ -194,7 +194,7 @@ if __name__ == "__main__":
             )
         )
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(run, p) for p in periods]
         for future in concurrent.futures.as_completed(futures):
             try:

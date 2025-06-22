@@ -68,28 +68,28 @@ class optimizer:
         params = {
             (p1, p2): {
                 PARAMS.beta_win: trial.suggest_int(
-                    f"{p1}_{p2}_{PARAMS.beta_win}", 2**4, 2**10, step=2**3
+                    f"{p1}_{p2}_{PARAMS.beta_win}", 2**10, 2**13, step=2**3
                 ),
                 PARAMS.z_win: trial.suggest_int(
-                    f"{p1}_{p2}_{PARAMS.z_win}", 2**4, 2**10, step=2**3
+                    f"{p1}_{p2}_{PARAMS.z_win}", 2**7, 2**10, step=2**3
                 ),
                 PARAMS.z_entry: trial.suggest_float(
-                    f"{p1}_{p2}_{PARAMS.z_entry}", 0.5, 1.5, step=0.1
+                    f"{p1}_{p2}_{PARAMS.z_entry}", 1.0, 3.0, step=0.2
                 ),
                 PARAMS.z_exit: trial.suggest_float(
-                    f"{p1}_{p2}_{PARAMS.z_exit}", 0.5, 1.5, step=0.1
+                    f"{p1}_{p2}_{PARAMS.z_exit}", 0.0, 1.0, step=0.2
                 ),
                 PARAMS.z_stop_scaler: (
                     trial.suggest_float(
-                        f"{p1}_{p2}_{PARAMS.z_stop_scaler}", 1.1, 2, step=0.1
+                        f"{p1}_{p2}_{PARAMS.z_stop_scaler}", 0.5, 2.0, step=0.5
                     )
                 ),
                 PARAMS.trade_freq: trial.suggest_categorical(
                     f"{p1}_{p2}_{PARAMS.trade_freq}",
-                    [str(i) + "m" for i in range(1, 11, 1)],
+                    [str(i) + "m" for i in range(2, 10, 1)],
                 ),
                 PARAMS.stop_loss: trial.suggest_float(
-                    f"{p1}_{p2}_{PARAMS.stop_loss}", 0.025, 0.05, step=0.025
+                    f"{p1}_{p2}_{PARAMS.stop_loss}", 0.01, 0.05, step=0.005
                 ),
             }
             for p1, p2 in pairs
@@ -115,21 +115,23 @@ class optimizer:
 
         # cumulative_returns = (1 + returns).prod()
 
-        count_trades = bt_df.select([col for col in bt_df.columns if "CAPITAL_" in col])
-        pct_time_invested = count_trades.with_columns(
-            pl.all().sign().abs()
-        ).sum_horizontal().sign().sum() / len(count_trades)
+        # count_trades = bt_df.select([col for col in bt_df.columns if "CAPITAL_" in col])
+        # if len(count_trades) == 0:
+        #     return -99
+        # pct_time_invested = count_trades.with_columns(
+        #     pl.all().sign().abs()
+        # ).sum_horizontal().sign().sum() / len(count_trades)
 
-        if np.nanstd(returns) == 0:
-            return -1e2
+        # if np.nanstd(returns) == 0:
+        #     return -1e2
 
-        # downside_vol = np.nanstd(returns[returns<0])
+        # # downside_vol = np.nanstd(returns[returns<0])
 
-        sharpe = (
-            np.nanmean(returns) / np.nanstd(returns) * np.sqrt(390 * 252)
-        )  # min level
+        # sharpe = (
+        #     np.nanmean(returns) / np.nanstd(returns) * np.sqrt(390 * 252)
+        # )  # min level
 
-        return sharpe * pct_time_invested
+        return (1 + returns).prod()
 
     def optimize(
         self, study_name, output_file_name, n_trials: int = 200

@@ -156,7 +156,10 @@ class cointegration_pairs:
                         x1_arr = df_arr[start + i]
                         for j in range(i + 1, n_this_cluster):
                             x2_arr = df_arr[start + j]
-                            if adf.ad_fuller(x1_arr) and adf.ad_fuller(x2_arr):
+                            if (
+                                adf.ad_fuller(x1_arr)[1] > p_val_cutoff
+                                and adf.ad_fuller(x2_arr)[1] > p_val_cutoff
+                            ):
                                 resid = coint(x1=x1_arr, x2=x2_arr)
                                 t, pval = adf.ad_fuller(resid)
                                 if pval <= p_val_cutoff:
@@ -169,7 +172,10 @@ class cointegration_pairs:
                 x1_arr = df_arr[i]
                 for j in range(i + 1, n + 1):
                     x2_arr = df_arr[j]
-                    if adf.ad_fuller(x1_arr) and adf.ad_fuller(x2_arr):
+                    if (
+                        adf.ad_fuller(x1_arr)[1] > p_val_cutoff
+                        and adf.ad_fuller(x2_arr)[1] > p_val_cutoff
+                    ):
                         resid = coint(x1=x1_arr, x2=x2_arr)
                         t, pval = adf.ad_fuller(resid)
                         if pval <= p_val_cutoff:

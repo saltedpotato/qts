@@ -1,10 +1,14 @@
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 
 class Performance:
     def __init__(
-        self, portfolio_ret: np.ndarray, years: int, trade_days: int = 252
+        self,
+        portfolio_ret: np.ndarray,
+        years: int,
+        trade_days: int = 252,
+        rolling=False,
     ) -> None:
         """
         Compute Performance Metrics
@@ -37,7 +41,8 @@ class Performance:
         self.portfolio_ret: np.ndarray = portfolio_ret[-self.timeframe :]
         self.rolling: np.ndarray = portfolio_ret
 
-        self.rolling_mean, self.rolling_std = self.compute_stat()
+        if rolling:
+            self.rolling_mean, self.rolling_std = self.compute_stat()
 
     def compute_stat(self) -> tuple[np.ndarray, np.ndarray]:
         return self._compute_stat(rolling=self.rolling, timeframe=self.timeframe)
@@ -150,7 +155,7 @@ class Performance:
         )
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_stat(
         rolling: np.ndarray, timeframe: int
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -163,7 +168,7 @@ class Performance:
         n: int = rolling.shape[0]
         rolling_std: np.ndarray = np.empty(n)
 
-        for i in range(n):
+        for i in prange(n):
             if i < timeframe - 1:
                 rolling_std[i] = np.nan
             else:
@@ -172,12 +177,12 @@ class Performance:
         return rolling_mean, rolling_std
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_cum_rets(rolling: np.ndarray) -> np.ndarray:
         return np.cumprod(rolling + 1)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_annualized_rets(
         portfolio_ret: np.ndarray, trade_days: int, timeframe: int
     ) -> float:
@@ -188,7 +193,7 @@ class Performance:
         return np.round(annualized_return * 100, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_sharpe(portfolio_ret: np.ndarray, trade_days: int) -> float:
         mean_return: float = portfolio_ret.mean()
         std_return: float = portfolio_ret.std()
@@ -197,7 +202,7 @@ class Performance:
         return np.round(sharpe, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_rolling_sharpe(
         rolling_mean: np.ndarray,
         rolling_std: np.ndarray,
@@ -208,7 +213,7 @@ class Performance:
         return np.round(rolling_sharpe, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_sortino(
         portfolio_ret: np.ndarray, downside_risk: float, trade_days: int
     ) -> float:
@@ -221,7 +226,7 @@ class Performance:
         return np.round(sortino, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_rolling_sortino(
         rolling: np.ndarray,
         rolling_mean: np.ndarray,
@@ -246,7 +251,7 @@ class Performance:
         return np.round(rolling_sortino, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_max_dd(portfolio_ret: np.ndarray) -> float:
         cum_ret: np.ndarray = np.cumprod(1 + portfolio_ret)
 
@@ -262,7 +267,7 @@ class Performance:
         return np.round(max_drawdown * 100, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_drawdown(rolling: np.ndarray) -> np.ndarray:
         cum_ret: np.ndarray = np.cumprod(1 + rolling)
         n: int = cum_ret.shape[0]
@@ -274,21 +279,21 @@ class Performance:
         return cum_ret / peak - 1
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_volatility(portfolio_ret: np.ndarray, trade_days: int) -> float:
         vol: float = portfolio_ret.std() * np.sqrt(trade_days)
 
         return np.round(vol * 100, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_rolling_volatilty(
         rolling_std: np.ndarray, trade_days: int
     ) -> np.ndarray:
         return np.round(rolling_std * np.sqrt(trade_days) * 100, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_information_ratio(
         portfolio_ret: np.ndarray,
         benchmark_ret: np.ndarray,
@@ -305,7 +310,7 @@ class Performance:
         return np.round(information_ratio, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_rolling_information_ratio(
         rolling: np.ndarray,
         rolling_mean: np.ndarray,
@@ -337,7 +342,7 @@ class Performance:
         return np.round(rolling_information_ratio, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_beta(
         portfolio_ret: np.ndarray, benchmark_ret: np.ndarray, timeframe: int
     ) -> float:
@@ -348,13 +353,13 @@ class Performance:
         return np.round(beta, 2)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_rolling_beta(
         rolling: np.ndarray, benchmark_ret: np.ndarray, timeframe: int
     ) -> np.ndarray:
         rolling_beta: np.ndarray = np.empty(benchmark_ret.shape[0])
 
-        for i in range(benchmark_ret.shape[0]):
+        for i in prange(benchmark_ret.shape[0]):
             if i < timeframe - 1:
                 rolling_beta[i] = np.nan
             else:
@@ -366,14 +371,14 @@ class Performance:
         return rolling_beta
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_alpha(
         beta: float, portfolio_ret: np.ndarray, benchmark_ret: np.ndarray
     ) -> float:
         return np.nanmean(portfolio_ret) - beta * np.nanmean(benchmark_ret)
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_rolling_alpha(
         beta: np.ndarray,
         rolling: np.ndarray,
@@ -382,7 +387,7 @@ class Performance:
         return rolling - beta * benchmark_ret
 
     @staticmethod
-    @njit(fastmath=True)
+    @njit
     def _compute_M2(
         sharpe: float, benchmark_ret: np.ndarray, timeframe: int, trade_days: int
     ) -> float:

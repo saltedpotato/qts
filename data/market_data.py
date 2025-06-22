@@ -40,19 +40,19 @@ class market_data:
 
         self.market_timing = {
             market_hours.DAYLIGHT: {
-                market_hours.PRE: datetime.time(7, 59, 0),  # 4:00 AM ET
-                market_hours.MARKET_OPEN: datetime.time(13, 29, 0),  # 9:30 AM ET
-                market_hours.MARKET_CLOSE: datetime.time(19, 59, 0),  # 4:00 PM ET
+                market_hours.PRE: datetime.time(8, 0, 0),  # 4:00 AM ET
+                market_hours.MARKET_OPEN: datetime.time(13, 30, 0),  # 9:30 AM ET
+                market_hours.MARKET_CLOSE: datetime.time(20, 0, 0),  # 4:00 PM ET
                 market_hours.POST: datetime.time(
                     0, 0, 0
                 ),  # 8:00 PM ET (00:00 UTC next day)
             },
             market_hours.NORMAL: {
-                market_hours.PRE: datetime.time(8, 59, 0),  # 4:00 AM ET
-                market_hours.MARKET_OPEN: datetime.time(14, 29, 0),  # 9:30 AM ET
-                market_hours.MARKET_CLOSE: datetime.time(20, 59, 0),  # 4:00 PM ET
+                market_hours.PRE: datetime.time(9, 0, 0),  # 4:00 AM ET
+                market_hours.MARKET_OPEN: datetime.time(14, 30, 0),  # 9:30 AM ET
+                market_hours.MARKET_CLOSE: datetime.time(21, 0, 0),  # 4:00 PM ET
                 market_hours.POST: datetime.time(
-                    0, 59, 0
+                    1, 0, 0
                 ),  # 8:00 PM ET (01:00 UTC next day)
             },
         }
@@ -187,8 +187,13 @@ class market_data:
     def filter(self, resample_freq, hours):
         df = self.filter_hours(hours=hours)
         df = self.resample_df(df=df, resample_freq=resample_freq)
+        remove_rows = (
+            df.group_by("date", maintain_order=True)
+            .agg(pl.all().pct_change().fill_null(0).sum())
+            .filter(pl.all_horizontal(pl.all().exclude(["date", "time"]) == 0))
+        )["date"].unique()
 
-        return df
+        return df.filter(~pl.col("date").is_in(remove_rows))
 
     def resample_df(
         self, df: pl.DataFrame = None, resample_freq: Optional[str] = None

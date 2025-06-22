@@ -29,42 +29,14 @@ warnings.filterwarnings("ignore")
 pio.templates.default = "ggplot2"
 
 
-out_path = "output/polygon/optimize_30d_w_cost_sharpe_scaled_z"
+out_path = "output/polygon/optimize_60d_w_cost_sharpe_scaled_z_longer_beta_hurst"
 
-
-dfs = [pl.read_csv(file) for file in glob.glob(f"{out_path}/result/result*.csv")]
-df = (
-    pl.concat(dfs, how="diagonal_relaxed")
-    .with_columns(
-        dt=(pl.col("date") + " " + pl.col("time")).str.to_datetime(
-            format="%Y-%m-%d %H:%M:%S.%f"
-        ),
-        date=pl.col("date").cast(pl.Date).dt.date(),
-        time=pl.col("time").str.to_time(format="%H:%M:%S.%f"),
-    )
-    .sort(by="dt")
-)
-
-
-# pairs_ret = (
-#     df.select([col for col in df.columns if "_PAIR_RET" in col] + ["dt"])
-#     .fill_null(0)
-#     .with_columns((pl.all().exclude("dt") + 1).cum_prod())
-# )
-
-# px.line(
-#     pairs_ret.to_pandas(), x="dt", y=[col for col in pairs_ret.columns if col != "dt"]
-# )
-
-
+# # GENERATE THE BT DFS
 etf = "QQQ"
 cons = get_cons(etf=etf)
 cons_date = cons.read()
 
-data = market_data(
-    file_path="C:/Users/edmun/OneDrive/Desktop/Quantitative Trading Strategies/Project/qts/data/polygon/*.parquet"
-)
-out_path = "output/polygon/optimize_30d_w_cost_sharpe_scaled_z"
+data = market_data(file_path="data/polygon/*.parquet")
 earliest_date_year = [
     i
     for i in cons_date.keys()
@@ -72,7 +44,7 @@ earliest_date_year = [
     >= datetime.strptime("2020-06-30", "%Y-%m-%d").date()
 ]
 
-periods = 30
+periods = 60
 
 period_ends = (
     pl.DataFrame(earliest_date_year, schema=["Date"])
@@ -87,9 +59,10 @@ period_ends = (
 )
 
 all_df = pl.DataFrame()
-for i in range(10, len(period_ends)):  # range(2, len(period_ends))
+all_bt = {}
+for i in range(5, len(period_ends)):  # range(2, len(period_ends))
     warm_start, train_start, train_end, trade_end = (
-        period_ends[i - 10],
+        period_ends[i - 5],
         period_ends[i - 2],
         period_ends[i - 1],
         period_ends[i],
@@ -160,23 +133,64 @@ for i in range(10, len(period_ends)):  # range(2, len(period_ends))
                 .alias(f"PORT_RET_w_{cost}_bps_cost")
             ).select(f"PORT_RET_w_{cost}_bps_cost")
         )
+
+        if cost not in all_bt.keys():
+            all_bt[cost] = pl.DataFrame()
+        all_bt[cost] = pl.concat([all_bt[cost], returns], how="diagonal_relaxed")
+
     cost_analysis_df = pl.concat(cost_analysis_df, how="horizontal")
     cost_analysis_df = cost_analysis_df.with_columns(returns.select(["date", "time"]))
     all_df = pl.concat([all_df, cost_analysis_df], how="vertical")
 
 
-cumulative_ret_df = all_df.with_columns(
-    (pl.all().exclude("date", "time") + 1).cum_prod()
-).to_pandas()
+for cost, df in all_bt.items():
+    df.write_parquet(f"{out_path}/performance/bt_w_{cost}_bps_cost.parquet")
 
-cumulative_ret_df["dt"] = cumulative_ret_df["date"].astype(str) + cumulative_ret_df[
-    "time"
-].astype(str)
+
+# # BT PERF METRICS
+all_df = pl.read_parquet(f"{out_path}/performance/results.parquet")
+
+
+cumret = all_df.with_columns((pl.all().exclude(["date", "time"]) + 1).cum_prod())
+cumret = cumret.rename(
+    {"PORT_RET_w_0.00030000000000000003_bps_cost": "PORT_RET_w_0.0003_bps_cost"}
+)
+
+fig = make_subplots(
+    rows=1,
+    cols=1,
+    subplot_titles=(
+        "Cumulative Returns",
+    ),
+)
+x = cumret["date"].to_numpy().flatten()
+
+for col in cumret.columns[:-2]:
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=cumret[col].to_numpy().flatten(),
+            mode="lines",
+            name=col,
+        ),
+        row=1,
+        col=1,
+    )
+fig.update_layout(
+    title_text="Performance Metrics",
+    height=800,
+    width=1800,
+    showlegend=True,
+)
+fig.show()
 
 
 (
-    all_df.with_columns((pl.all().exclude("date", "time") + 1).cum_prod()).to_pandas()
-).iloc[:, :-2].plot(figsize=(30, 10))
+    all_df.with_columns((pl.all().exclude(["date", "time"]) + 1).cum_prod())[-1]
+    .drop(["date", "time"])
+    .to_pandas()
+    ** (390 * 252 / len(all_df))
+) - 1
 
 
 all_single_metrics = {}
@@ -184,28 +198,22 @@ all_rolling_metrics = {}
 
 
 for col in all_df.columns[:-2]:
-    perf = Performance(
+    single_pef = Performance(
         portfolio_ret=all_df.select(col).fill_null(0).to_numpy().flatten(),
         years=len(all_df) / 390 * 252,
         trade_days=390 * 252,
+        rolling=False,
     )
 
     all_single_metrics[col] = {
-        "Cumulative Returns": perf.compute_cum_rets()[-1],
-        "Annualized Returns": perf.compute_annualized_rets(),
-        "Sharpe Ratio": perf.compute_sharpe(),
-        "Sortino Ratio": perf.compute_sortino(0),
-        "Max Drawdown": perf.compute_max_dd(),
-        "Volatility": perf.compute_volatility(),
+        "Cumulative Returns": single_pef.compute_cum_rets()[-1],
+        "Annualized Returns": single_pef.compute_annualized_rets(),
+        "Sharpe Ratio": single_pef.compute_sharpe(),
+        "Sortino Ratio": single_pef.compute_sortino(0),
+        "Max Drawdown": single_pef.compute_max_dd(),
+        "Volatility": single_pef.compute_volatility(),
     }
 
-    all_rolling_metrics[col] = {
-        "Cumulative Returns": perf.compute_cum_rets(),
-        # "Rolling Sharpe": perf.compute_rolling_sharpe(),
-        # "Rolling Sortino": perf.compute_rolling_sortino(0),
-        "Drawdown": perf.compute_drawdown(),
-        "Rolling Volatility": perf.compute_rolling_volatility(),
-    }
 
 
 metrics_df = pl.DataFrame()
@@ -229,10 +237,32 @@ metrics_df.insert_column(
 )
 
 
+for col in all_df.columns[:-2]:
+    rolling_perf = Performance(
+        portfolio_ret=all_df.select(col).fill_null(0).to_numpy().flatten(),
+        years=1,
+        trade_days=390 * 252,
+        rolling=True,
+    )
+
+    all_rolling_metrics[col] = {
+        "Cumulative Returns": rolling_perf.compute_cum_rets(),
+        "Rolling Sharpe": rolling_perf.compute_rolling_sharpe(),
+        "Rolling Sortino": rolling_perf.compute_rolling_sortino(0),
+        "Drawdown": rolling_perf.compute_drawdown(),
+        "Rolling Volatility": rolling_perf.compute_rolling_volatility(),
+    }
+
+
 fig = make_subplots(
-    rows=3,
+    rows=4,
     cols=1,
-    subplot_titles=("Cumulative Returns", "Drawdown", "Rolling Volatility"),
+    subplot_titles=(
+        "Cumulative Returns",
+        "Drawdown",
+        "1Y Rolling Volatility",
+        "1Y Rolling Sharpe",
+    ),
 )
 x = all_df["date"].to_numpy().flatten()
 
@@ -242,8 +272,7 @@ for col in all_df.columns[:-2]:
             x=x,
             y=all_rolling_metrics[col]["Cumulative Returns"],
             mode="lines",
-            name="Cumulative Returns",
-            # line=dict(color="blue"),
+            name=col,
         ),
         row=1,
         col=1,
@@ -254,39 +283,136 @@ for col in all_df.columns[:-2]:
             x=x,
             y=all_rolling_metrics[col]["Drawdown"],
             mode="lines",
-            name="Drawdown",
-            # line=dict(color="red"),
+            name=col,
         ),
         row=2,
         col=1,
     )
 
-    # fig.add_trace(
-    #     go.Scatter(
-    #         x=x,
-    #         y=all_rolling_metrics[col]["Rolling Volatility"],
-    #         mode="lines",
-    #         name="Rolling Volatility",
-    #         # line=dict(color="green"),
-    #     ),
-    #     row=3,
-    #     col=1,
-    # )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=all_rolling_metrics[col]["Rolling Volatility"],
+            mode="lines",
+            name=col,
+        ),
+        row=3,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=all_rolling_metrics[col]["Rolling Sharpe"],
+            mode="lines",
+            name=col,
+        ),
+        row=4,
+        col=1,
+    )
 
 fig.update_layout(
     title_text="Performance Metrics",
     height=1500,
     width=1500,
-    showlegend=False,
+    showlegend=True,
 )
 
 # Show the figure
 fig.show()
 
 
+# # BEST PAIRS
+no_cost_bt = pl.read_parquet(f"{out_path}/performance/bt_w_0.0_bps_cost.parquet")
 
+
+MEGA = (
+    all_bt[0.0]
+    .select([col for col in all_bt[0.0].columns if "CAPITAL_" in col])
+    .with_columns(
+        *[
+            (
+                pl.when((pl.col(col).shift(-1) != 0))
+                .then(
+                    ((pl.col(col) - pl.col(col).shift(1)) / pl.col(col).shift(1).abs())
+                )
+                .otherwise(None)
+                .fill_null(0)
+                .fill_nan(0)
+                for col in [col for col in all_bt[0.0].columns if "CAPITAL_" in col]
+            )
+        ]
+    )
+    .with_columns(
+        *[
+            (
+                pl.when((pl.col(col).is_infinite()))
+                .then(0)
+                .otherwise(pl.col(col))
+                .alias(f"RET_{col}")
+                .fill_null(0)
+                .fill_nan(0)
+                for col in [col for col in all_bt[0.0].columns if "CAPITAL_" in col]
+            )
+        ]
+    )
+)
+
+
+top_bot = MEGA.select(
+    [
+        "RET_CAPITAL_CRWD_ON_ROST",
+        "RET_CAPITAL_GILD_ON_TEAM",
+        "RET_CAPITAL_ALGN_ON_ZS",
+        "RET_CAPITAL_AMGN_ON_JD",
+        "RET_CAPITAL_CHTR_ON_MTCH",
+        "RET_CAPITAL_AMAT_ON_ORLY",
+        "RET_CAPITAL_MAR_ON_MRVL",
+        "RET_CAPITAL_GFS_ON_SNPS",
+        "RET_CAPITAL_ADBE_ON_BIIB",
+        "RET_CAPITAL_CMCSA_ON_MAR",
+    ]
+).with_columns((pl.all() + 1).cum_prod())
+
+x = no_cost_bt["date"].to_numpy().flatten()
+
+fig = make_subplots(
+    rows=1,
+    cols=1,
+    subplot_titles=(
+        "Cumulative Returns",
+    ),
+)
+
+for col in top_bot.columns:
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=top_bot[col].to_numpy().flatten(),
+            mode="lines",
+            name=col,
+        ),
+        row=1,
+        col=1,
+    )
+    
+fig.update_layout(
+    title_text="Performance Metrics",
+    height=800,
+    width=1800,
+    showlegend=True,
+)
+fig.show()
+
+
+MEGA.select([col for col in MEGA.columns if "RET_CAPITAL" in col]).with_columns(
+    (pl.all() + 1).cum_prod() - 1
+)[-1].transpose(include_header=True).sort(by="column_0")
+
+
+# # LOOK AT BEST TRAILS
 dfs = [
-    pl.read_csv(file).with_columns(pl.Series(name="file", values=[file] * 150))
+    pl.read_csv(file).with_columns(pl.Series(name="file", values=[file] * 100))
     for file in glob.glob(f"{out_path}/trials/trials*.csv")
 ]
 df = pl.concat(dfs, how="diagonal_relaxed")
