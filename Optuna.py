@@ -8,6 +8,13 @@ from numba import njit, prange
 
 from itertools import combinations
 
+# note! need to ensure to get (2xwindow_size - 2) more datapoints so it neatly dropna into start of quarter
+# drop 1 LESS for returns calculation
+
+
+# to do - after compute_rolling_zscore, trim x and y (should be [2 * window_size - 3:])
+# to do - need to drop first row after compute_positions?
+# !!!! REMOVE WINDOW_SIZE WILL NOT NEED AFTERWARDS IN COMPUTE_POSITIONS !!!!!!
 class PairsBacktester():
     
     @staticmethod
@@ -568,54 +575,117 @@ quarters = [
     (datetime(2025, 3, 1), datetime(2025, 6, 1))
     ]
 
+
+n_coint_pairs = 10  
+max_positions = 2
+entry_zscore = 2.5
+take_profit_zscore = 0.5
+stop_loss_zscore = 3.0
+reentry_delay = 60
+beta_window_size = 6000
+zscore_window_size = 1000
+warmup_size = beta_window_size + zscore_window_size - 2
+trading_cost = 0.0005
+
+flattened_list = []
+returns_array = np.array([])
+
+main_df = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
+
+for period in quarters:
+    print(period)
+
+    ############### ADF ###############
+    adf_df = main_df[(main_df["t"] >= period[0]) & (main_df["t"] < period[1])]
+    adf_df = adf_df.set_index('t').resample('1h').last()
+    adf_df = adf_df.ffill().dropna(axis = 1).dropna(axis = 0).astype(np.float64)
+    
+    # Filter price columns
+    symbols = [col for col in adf_df.columns if col != "t"]  # exclude timestamp
+    adf_array = adf_df[symbols].to_numpy()  # T x N matrix (prices only)
+    
+    # Create all unique pair index combinations
+    pair_indices = np.array(list(combinations(range(len(symbols)), 2)))  # shape (M, 2)
+    
+    # Run the Numba-parallel ADF proxy
+    tau_stats, valid_flags = PairsBacktester.rank_cointegrated_pairs(adf_array, pair_indices)
+    
+    # Extract top N pairs by most negative tau
+    valid_idx = np.where(valid_flags == 1)[0]
+    sorted_idx = valid_idx[np.argsort(tau_stats[valid_idx])]
+
+    top_pairs = [pair_indices[i] for i in sorted_idx[:n_coint_pairs]]
+    
+    # Convert index pairs to ticker symbols and show tau
+    top_pairs_named = [(symbols[i], symbols[j], tau_stats[idx]) for idx, (i, j) in zip(sorted_idx[:n_coint_pairs], top_pairs)]
+    top_pair_tuples = [(i, j) for i, j, _ in top_pairs_named]
+    
+    # if first period no pairs yet. 
+    if flattened_list == []:
+        flattened_list = [item for tup in top_pair_tuples for item in tup]
+        continue
+    
+    mask = (main_df["t"] >= period[0]) & (main_df["t"] < period[1])
+    date_range_indices = main_df[mask].index
+    start_idx = max(0, date_range_indices[0] - warmup_size)
+    end_idx = date_range_indices[-1] + 1  # inclusive
+    price_array = main_df.iloc[start_idx:end_idx]
+
+    price_array = price_array[flattened_list]
+    price_array = price_array.to_numpy()
+    
+    beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(price_array, beta_window_size = beta_window_size, zscore_window_size = zscore_window_size)
+    
+    positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(price_array[warmup_size:], beta_matrix[warmup_size:], spread_matrix[warmup_size:], zscore_matrix[warmup_size:], 
+                                                                                          max_positions = max_positions, entry_zscore = entry_zscore, 
+                                                                                          take_profit_zscore = take_profit_zscore, stop_loss_zscore = stop_loss_zscore, 
+                                                                                          reentry_delay = reentry_delay, trading_cost = trading_cost)
+    
+    returns_array = np.concatenate((returns_array, returns_matrix))
+    
+    flattened_list = [item for tup in top_pair_tuples for item in tup]
+
+    
+import matplotlib.pyplot as plt
+plt.plot(np.cumprod(1+returns_array[1:]))
+plt.show()
+
+abc = '''
+[I 2025-06-22 12:09:16,818] Trial 192 finished with value: 1.8997156811319735 
+and parameters: {'n_coint_pairs': 10, 'max_positions': 1, 'entry_zscore': 1.5, 'take_profit_zscore': 0.0, 'stop_loss_zscore': 3.0, 'reentry_delay': 60, 'beta_window_size': 6500, 'zscore_window_size': 8000}. 
+Best is trial 192 with value: 1.8997156811319735.
+'''
+
+############################################# OPTUNA EDMUND METHOD #############################################
+
+
 import optuna
 
-def objective(trial):
-    # Sample hyperparameters
-    n_coint_pairs     = trial.suggest_categorical("n_coint_pairs", [10, 20])
-    max_positions     = trial.suggest_int("max_positions", 1, 4)
-    
-    entry_zscore      = trial.suggest_categorical("entry_zscore", [1.5, 2.0, 2.5, 3.0])
-    take_profit_zscore = trial.suggest_categorical("take_profit_zscore", [0.0, 0.5])
-    stop_loss_zscore  = trial.suggest_categorical("stop_loss_zscore", [3.0, 3.5, 4.0])
-    
-    reentry_delay     = trial.suggest_categorical("reentry_delay", [60, 120, 180, 240])
-    beta_window_size  = trial.suggest_int("beta_window_size", 100, 8000, step=100)
-    zscore_window_size = trial.suggest_int("zscore_window_size", 100, 8000, step=100)
-    trading_cost      = 0.0005
+# === Load full data ===
+main_df = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
 
-    warmup_size = beta_window_size + zscore_window_size - 2
+# === Define objective function factory ===
+def make_objective(main_df, prev_pairs, prev_symbols, current_period):
+    def objective(trial):
+        n_coint_pairs = 10
+        max_positions = trial.suggest_int("max_positions", 1, 4)
+        entry_zscore = trial.suggest_categorical("entry_zscore", [1.5, 2.0, 2.5, 3.0])
+        take_profit_zscore = trial.suggest_categorical("take_profit_zscore", [0.0, 0.5])
+        stop_loss_zscore = trial.suggest_categorical("stop_loss_zscore", [3.0, 3.5, 4.0])
+        reentry_delay = trial.suggest_categorical("reentry_delay", [60, 120, 180, 240])
+        beta_window_size = trial.suggest_int("beta_window_size", 100, 8000, step=100)
+        zscore_window_size = trial.suggest_int("zscore_window_size", 100, 8000, step=100)
+        trading_cost = 0.0005
+        warmup_size = beta_window_size + zscore_window_size - 2
 
-    # === Load & prepare data ===
-    main_df = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
-    flattened_list = []
-    returns_array = np.array([])
-
-    for period in quarters:
-        adf_df = main_df[(main_df["t"] >= period[0]) & (main_df["t"] < period[1])]
-        adf_df = adf_df.set_index('t').resample('1h').last()
-        adf_df = adf_df.ffill().dropna(axis=1).dropna(axis=0).astype(np.float64)
-
-        symbols = [col for col in adf_df.columns if col != "t"]
-        adf_array = adf_df[symbols].to_numpy()
-        pair_indices = np.array(list(combinations(range(len(symbols)), 2)))
-
-        tau_stats, valid_flags = PairsBacktester.rank_cointegrated_pairs(adf_array, pair_indices)
-        valid_idx = np.where(valid_flags == 1)[0]
-        sorted_idx = valid_idx[np.argsort(tau_stats[valid_idx])]
-        top_pairs = [pair_indices[i] for i in sorted_idx[:n_coint_pairs]]
-        top_pairs_named = [(symbols[i], symbols[j], tau_stats[idx]) for idx, (i, j) in zip(sorted_idx[:n_coint_pairs], top_pairs)]
-        top_pair_tuples = [(i, j) for i, j, _ in top_pairs_named]
-
-        if flattened_list == []:
-            flattened_list = [item for tup in top_pair_tuples for item in tup]
-            continue
-
-        mask = (main_df["t"] >= period[0]) & (main_df["t"] < period[1])
+        mask = (main_df["t"] >= current_period[0]) & (main_df["t"] < current_period[1])
         date_range_indices = main_df[mask].index
+        if len(date_range_indices) == 0:
+            return -999.0
+
         start_idx = max(0, date_range_indices[0] - warmup_size)
         end_idx = date_range_indices[-1] + 1
-        price_array = main_df.iloc[start_idx:end_idx][flattened_list].to_numpy()
+        price_array = main_df.iloc[start_idx:end_idx][prev_symbols].to_numpy()
 
         beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(
             price_array, beta_window_size=beta_window_size, zscore_window_size=zscore_window_size
@@ -629,20 +699,274 @@ def objective(trial):
                 reentry_delay=reentry_delay, trading_cost=trading_cost
             )
         except:
-            return -999.0  # fail-safe
+            return -999.0
 
-        returns_array = np.concatenate((returns_array, returns_matrix))
-        returns_array = returns_array[~np.isnan(returns_array)]
-        flattened_list = [item for tup in top_pair_tuples for item in tup]
+        returns_array = returns_matrix[~np.isnan(returns_matrix)]
+        if len(returns_array) < 2:
+            return -999.0
 
-    # === Objective: maximize total return ===
-    #cumulative_return = np.cumprod(1+returns_matrix[1:])
-    return np.prod(1 + returns_array[1:]) - 1
+        total_return = np.prod(1 + returns_array[1:]) - 1
+        trial.set_user_attr("total_return", total_return)
 
-study = optuna.create_study(direction="maximize")
-study.optimize(objective, n_trials=500)
+        #sharpe = returns_array.mean() / (returns_array.std() + 1e-8)
+        #annualized_sharpe = sharpe * np.sqrt(252 * 390)
+        return total_return
 
-print("Best trial:")
-print(study.best_trial)
-print("Best parameters:")
-print(study.best_params)
+    return objective
+
+
+# === Load and prepare data ===
+main_df = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
+
+# Define quarterly periods
+quarters = [
+    (datetime(2020, 6, 1), datetime(2020, 9, 1)),
+    (datetime(2020, 9, 1), datetime(2020, 12, 1)),
+    (datetime(2020, 12, 1), datetime(2021, 3, 1)), 
+    (datetime(2021, 3, 1), datetime(2021, 6, 1)),
+    (datetime(2021, 6, 1), datetime(2021, 9, 1)),
+    (datetime(2021, 9, 1), datetime(2021, 12, 1)),
+    (datetime(2021, 12, 1), datetime(2022, 3, 1)),
+    (datetime(2022, 3, 1), datetime(2022, 6, 1)),
+    (datetime(2022, 6, 1), datetime(2022, 9, 1)),
+    (datetime(2022, 9, 1), datetime(2022, 12, 1)),
+    (datetime(2022, 12, 1), datetime(2023, 3, 1)),
+    (datetime(2023, 3, 1), datetime(2023, 6, 1)),
+    (datetime(2023, 6, 1), datetime(2023, 9, 1)),
+    (datetime(2023, 9, 1), datetime(2023, 12, 1)),
+    (datetime(2023, 12, 1), datetime(2024, 3, 1)),
+    (datetime(2024, 3, 1), datetime(2024, 6, 1)),
+    (datetime(2024, 6, 1), datetime(2024, 9, 1)),
+    (datetime(2024, 9, 1), datetime(2024, 12, 1)),
+    (datetime(2024, 12, 1), datetime(2025, 3, 1)),
+    (datetime(2025, 3, 1), datetime(2025, 6, 1))
+    ]
+results = []
+
+for i in range(1, len(quarters)):  # start from Q2
+    prev_period = quarters[i - 1]
+    current_period = quarters[i]
+
+    print(f"\n🔍 Optimizing Q{i+1} using Q{i} pairs: {prev_period[0].date()} → {prev_period[1].date()}")
+
+    # --- Step 1: get pairs from previous quarter ---
+    adf_df = main_df[(main_df["t"] >= prev_period[0]) & (main_df["t"] < prev_period[1])]
+    adf_df = adf_df.set_index("t").resample("1h").last().ffill().dropna(axis=1).astype(np.float64)
+
+    symbols = adf_df.columns.tolist()
+    adf_array = adf_df[symbols].to_numpy()
+    pair_indices = np.array(list(combinations(range(len(symbols)), 2)))
+
+    tau_stats, valid_flags = PairsBacktester.rank_cointegrated_pairs(adf_array, pair_indices)
+    valid_idx = np.where(valid_flags == 1)[0]
+    sorted_idx = valid_idx[np.argsort(tau_stats[valid_idx])]
+    top_pairs = [pair_indices[i] for i in sorted_idx[:20]]
+
+    used_symbols = sorted(set(i for pair in top_pairs for i in pair))
+    prev_symbols = [symbols[i] for i in used_symbols]
+    prev_pairs = [(symbols[i], symbols[j]) for i, j in top_pairs]
+
+    # --- Step 2: optimize current quarter using prev_pairs ---
+    objective = make_objective(main_df, prev_pairs, prev_symbols, current_period)
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20)
+
+    best = {
+        "quarter": f"{current_period[0].date()} to {current_period[1].date()}",
+        "sharpe": study.best_value,
+        "total_return": study.best_trial.user_attrs.get("total_return", np.nan),
+        "params": study.best_params
+    }
+    results.append(best)
+    print(f"✅ Best Sharpe: {best['sharpe']:.4f} | Total Return: {best['total_return']:.4%}")
+
+# === Dump as DataFrame ===
+results_df = pd.DataFrame(results)
+results_df.to_csv("optuna_quarter_results.csv", index=False)
+print("\n🎯 Optimization complete. Results saved to 'optuna_quarter_results.csv'")
+
+plt.plot(np.cumprod(1+results_df["total_return"]))
+plt.show()
+
+optuna_returns = results_df["total_return"].to_numpy()
+returns_array = returns_array[~np.isnan(returns_array)]
+bt_returns = np.cumprod(1 + returns_array[1:]) - 1
+quarters = len(optuna_returns)
+
+for i in range(quarters):
+    r_optuna = optuna_returns[i]
+    r_bt = bt_returns[i]
+
+    print(f"Q{i+2}: optuna={r_optuna:.4%}, backtest={r_bt:.4%}, diff={abs(r_bt - r_optuna):.4%}")
+
+##############################################################################
+
+
+
+combined_configs = [
+    # Q1 – for pair selection only (no backtest)
+    {"quarter_start": datetime(2020, 6, 1), "quarter_end": datetime(2020, 9, 1), "config": None},
+
+    # Q2 – Q20
+    {"quarter_start": datetime(2020, 9, 1), "quarter_end": datetime(2020, 12, 1),
+     "max_positions": 2, "entry_zscore": 2.0, "take_profit_zscore": 0.5, "stop_loss_zscore": 3.0,
+     "reentry_delay": 180, "beta_window_size": 2200, "zscore_window_size": 700},
+
+    {"quarter_start": datetime(2020, 12, 1), "quarter_end": datetime(2021, 3, 1),
+     "max_positions": 1, "entry_zscore": 1.5, "take_profit_zscore": 0.0, "stop_loss_zscore": 4.0,
+     "reentry_delay": 60, "beta_window_size": 500, "zscore_window_size": 3700},
+
+    {"quarter_start": datetime(2021, 3, 1), "quarter_end": datetime(2021, 6, 1),
+     "max_positions": 2, "entry_zscore": 2.0, "take_profit_zscore": 0.0, "stop_loss_zscore": 4.0,
+     "reentry_delay": 240, "beta_window_size": 3100, "zscore_window_size": 3700},
+
+    {"quarter_start": datetime(2021, 6, 1), "quarter_end": datetime(2021, 9, 1),
+     "max_positions": 2, "entry_zscore": 2.0, "take_profit_zscore": 0.5, "stop_loss_zscore": 3.0,
+     "reentry_delay": 120, "beta_window_size": 6200, "zscore_window_size": 5100},
+
+    {"quarter_start": datetime(2021, 9, 1), "quarter_end": datetime(2021, 12, 1),
+     "max_positions": 4, "entry_zscore": 3.0, "take_profit_zscore": 0.5, "stop_loss_zscore": 4.0,
+     "reentry_delay": 120, "beta_window_size": 6700, "zscore_window_size": 6900},
+
+    {"quarter_start": datetime(2021, 12, 1), "quarter_end": datetime(2022, 3, 1),
+     "max_positions": 1, "entry_zscore": 2.0, "take_profit_zscore": 0.5, "stop_loss_zscore": 4.0,
+     "reentry_delay": 120, "beta_window_size": 6500, "zscore_window_size": 1800},
+
+    {"quarter_start": datetime(2022, 3, 1), "quarter_end": datetime(2022, 6, 1),
+     "max_positions": 1, "entry_zscore": 2.0, "take_profit_zscore": 0.0, "stop_loss_zscore": 3.5,
+     "reentry_delay": 120, "beta_window_size": 4100, "zscore_window_size": 6800},
+
+    {"quarter_start": datetime(2022, 6, 1), "quarter_end": datetime(2022, 9, 1),
+     "max_positions": 1, "entry_zscore": 1.5, "take_profit_zscore": 0.5, "stop_loss_zscore": 4.0,
+     "reentry_delay": 60, "beta_window_size": 3000, "zscore_window_size": 5700},
+
+    {"quarter_start": datetime(2022, 9, 1), "quarter_end": datetime(2022, 12, 1),
+     "max_positions": 2, "entry_zscore": 3.0, "take_profit_zscore": 0.5, "stop_loss_zscore": 3.5,
+     "reentry_delay": 180, "beta_window_size": 5100, "zscore_window_size": 200},
+
+    {"quarter_start": datetime(2022, 12, 1), "quarter_end": datetime(2023, 3, 1),
+     "max_positions": 3, "entry_zscore": 2.5, "take_profit_zscore": 0.0, "stop_loss_zscore": 4.0,
+     "reentry_delay": 120, "beta_window_size": 5400, "zscore_window_size": 3800},
+
+    {"quarter_start": datetime(2023, 3, 1), "quarter_end": datetime(2023, 6, 1),
+     "max_positions": 1, "entry_zscore": 2.0, "take_profit_zscore": 0.0, "stop_loss_zscore": 3.0,
+     "reentry_delay": 240, "beta_window_size": 7500, "zscore_window_size": 2500},
+
+    {"quarter_start": datetime(2023, 6, 1), "quarter_end": datetime(2023, 9, 1),
+     "max_positions": 1, "entry_zscore": 2.0, "take_profit_zscore": 0.5, "stop_loss_zscore": 4.0,
+     "reentry_delay": 120, "beta_window_size": 4900, "zscore_window_size": 4800},
+
+    {"quarter_start": datetime(2023, 9, 1), "quarter_end": datetime(2023, 12, 1),
+     "max_positions": 1, "entry_zscore": 1.5, "take_profit_zscore": 0.5, "stop_loss_zscore": 3.0,
+     "reentry_delay": 240, "beta_window_size": 3900, "zscore_window_size": 6400},
+
+    {"quarter_start": datetime(2023, 12, 1), "quarter_end": datetime(2024, 3, 1),
+     "max_positions": 2, "entry_zscore": 2.0, "take_profit_zscore": 0.5, "stop_loss_zscore": 3.0,
+     "reentry_delay": 60, "beta_window_size": 1900, "zscore_window_size": 400},
+
+    {"quarter_start": datetime(2024, 3, 1), "quarter_end": datetime(2024, 6, 1),
+     "max_positions": 3, "entry_zscore": 1.5, "take_profit_zscore": 0.5, "stop_loss_zscore": 3.0,
+     "reentry_delay": 60, "beta_window_size": 5200, "zscore_window_size": 2500},
+
+    {"quarter_start": datetime(2024, 6, 1), "quarter_end": datetime(2024, 9, 1),
+     "max_positions": 1, "entry_zscore": 1.5, "take_profit_zscore": 0.0, "stop_loss_zscore": 3.5,
+     "reentry_delay": 120, "beta_window_size": 4800, "zscore_window_size": 5400},
+
+    {"quarter_start": datetime(2024, 9, 1), "quarter_end": datetime(2024, 12, 1),
+     "max_positions": 4, "entry_zscore": 2.5, "take_profit_zscore": 0.0, "stop_loss_zscore": 3.0,
+     "reentry_delay": 240, "beta_window_size": 3700, "zscore_window_size": 6700},
+
+    {"quarter_start": datetime(2024, 12, 1), "quarter_end": datetime(2025, 3, 1),
+     "max_positions": 2, "entry_zscore": 1.5, "take_profit_zscore": 0.5, "stop_loss_zscore": 3.5,
+     "reentry_delay": 120, "beta_window_size": 2400, "zscore_window_size": 700},
+
+    {"quarter_start": datetime(2025, 3, 1), "quarter_end": datetime(2025, 6, 1),
+     "max_positions": 2, "entry_zscore": 1.5, "take_profit_zscore": 0.0, "stop_loss_zscore": 4.0,
+     "reentry_delay": 120, "beta_window_size": 3100, "zscore_window_size": 2600}
+]
+
+
+flattened_list = []
+returns_array = np.array([])
+
+main_df = pd.read_parquet(r"C:\Users\Zeke\Desktop\Data Hoarder\Polygon\full_qqq.parquet")
+
+for i in range(1, len(combined_configs)):  # start from Q2
+    prev_cfg = combined_configs[i - 1]
+    curr_cfg = combined_configs[i]
+
+    q_start = curr_cfg["quarter_start"]
+    q_end = curr_cfg["quarter_end"]
+
+    print(f"\n=== Backtesting {q_start.date()} to {q_end.date()} ===")
+
+    # === Step 1: ADF pair selection using *previous quarter*
+    adf_df = main_df[(main_df["t"] >= prev_cfg["quarter_start"]) & (main_df["t"] < prev_cfg["quarter_end"])]
+    adf_df = adf_df.set_index("t").resample("1h").last()
+    adf_df = adf_df.ffill().dropna(axis=1).dropna(axis=0).astype(np.float64)
+
+    symbols = adf_df.columns.tolist()
+    adf_array = adf_df.to_numpy()
+    pair_indices = np.array(list(combinations(range(len(symbols)), 2)))
+
+    tau_stats, valid_flags = PairsBacktester.rank_cointegrated_pairs(adf_array, pair_indices)
+    valid_idx = np.where(valid_flags == 1)[0]
+    sorted_idx = valid_idx[np.argsort(tau_stats[valid_idx])]
+
+    n_coint_pairs = 10
+    top_pairs = [pair_indices[i] for i in sorted_idx[:n_coint_pairs]]
+    top_pair_tuples = [(symbols[i], symbols[j]) for (i, j) in top_pairs]
+
+    # flatten unique symbols
+    flattened_list = list(dict.fromkeys([item for tup in top_pair_tuples for item in tup]))
+
+    # === Step 2: Load backtest window
+    warmup_size = curr_cfg["beta_window_size"] + curr_cfg["zscore_window_size"] - 2
+    mask = (main_df["t"] >= q_start) & (main_df["t"] < q_end)
+    date_range_indices = main_df[mask].index
+    start_idx = max(0, date_range_indices[0] - warmup_size)
+    end_idx = date_range_indices[-1] + 1
+
+    price_array = main_df.iloc[start_idx:end_idx][flattened_list].to_numpy()
+
+    # === Step 3: Run rolling calculations
+    beta_matrix, spread_matrix, zscore_matrix = PairsBacktester.compute_rolling_zscore(
+        price_array,
+        beta_window_size=curr_cfg["beta_window_size"],
+        zscore_window_size=curr_cfg["zscore_window_size"]
+    )
+
+    # === Step 4: Simulate strategy
+    positions_matrix, weights_matrix, returns_matrix = PairsBacktester.simulate_portfolio(
+        price_array[warmup_size:],
+        beta_matrix[warmup_size:],
+        spread_matrix[warmup_size:],
+        zscore_matrix[warmup_size:],
+        max_positions=curr_cfg["max_positions"],
+        entry_zscore=curr_cfg["entry_zscore"],
+        take_profit_zscore=curr_cfg["take_profit_zscore"],
+        stop_loss_zscore=curr_cfg["stop_loss_zscore"],
+        reentry_delay=curr_cfg["reentry_delay"],
+        trading_cost=0.0004
+    )
+
+    # === Step 5: Store results
+    returns_array = np.concatenate((returns_array, returns_matrix))
+
+returns_array = returns_array[~np.isnan(returns_array)]
+
+import matplotlib.pyplot as plt
+plt.plot(np.cumprod(1+returns_array[1:]))
+plt.show()
+
+
+returns_df = pd.DataFrame({
+    "run_1": returns_array_1,#0
+    "run_2": returns_array_2,#1
+    "run_3": returns_array_3,#2
+    "run_4": returns_array_4,#3
+    "run_5": returns_array_5,#4
+    "run_6": returns_array_6#5
+})
+
+returns_df.to_csv("rtns different costs.csv")
